@@ -16,6 +16,9 @@ import { StrictMode } from "react";
 interface SvgPrimitiveArray {
   layer: string; // "parent/child1/child2"のような階層パス
   svg_primitives: string[];
+  config: {
+    visible_by_default?: boolean;
+  }
 }
 
 interface SvgLayerArray {
@@ -195,7 +198,8 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
             const newNamespaces = { ...prevConfig.namespaces };
             msg.svg_primitive_arrays.forEach((svg_primitive_array) => {
               if (!newNamespaces[svg_primitive_array.layer]) {
-                newNamespaces[svg_primitive_array.layer] = { visible: true };
+                const defaultVisibility = svg_primitive_array.config?.visible_by_default ?? true;
+                newNamespaces[svg_primitive_array.layer] = { visible: defaultVisibility };
               }
             });
             return { ...prevConfig, namespaces: newNamespaces };
@@ -274,13 +278,17 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
             setViewBox(`${newX} ${newY} ${newWidth} ${newHeight}`);
           }}
         >
-          {latest_msg && latest_msg.svg_primitive_arrays.map((svg_primitive_array, index) => (
-            <g key={svg_primitive_array.layer} style={{ display: config.namespaces[svg_primitive_array.layer]?.visible ? 'block' : 'none' }}>
-              {svg_primitive_array.svg_primitives.map((svg_primitive, index) => (
-                <g dangerouslySetInnerHTML={{ __html: svg_primitive }} />
-              ))}
-            </g>
-          ))}
+          {latest_msg && latest_msg.svg_primitive_arrays.map((svg_primitive_array, index) => {
+            // 明示的に true の場合のみ表示（デフォルトは非表示）
+            const isVisible = config.namespaces[svg_primitive_array.layer]?.visible === true;
+            return (
+              <g key={svg_primitive_array.layer} style={{ display: isVisible ? 'block' : 'none' }}>
+                {svg_primitive_array.svg_primitives.map((svg_primitive, svgIndex) => (
+                  <g key={svgIndex} dangerouslySetInnerHTML={{ __html: svg_primitive }} />
+                ))}
+              </g>
+            );
+          })}
         </svg>
       </div>
     </div>
