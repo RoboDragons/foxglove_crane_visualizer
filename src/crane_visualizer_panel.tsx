@@ -279,10 +279,8 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
           }}
         >
           {latest_msg && latest_msg.svg_primitive_arrays.map((svg_primitive_array, index) => {
-            // 明示的に true の場合のみ表示（デフォルトは非表示）
-            const isVisible = config.namespaces[svg_primitive_array.layer]?.visible === true;
             return (
-              <g key={svg_primitive_array.layer} style={{ display: isVisible ? 'block' : 'none' }}>
+              <g key={svg_primitive_array.layer} style={{ display: config.namespaces[svg_primitive_array.layer]?.visible  ? 'block' : 'none' }}>
                 {svg_primitive_array.svg_primitives.map((svg_primitive, svgIndex) => (
                   <g key={svgIndex} dangerouslySetInnerHTML={{ __html: svg_primitive }} />
                 ))}
