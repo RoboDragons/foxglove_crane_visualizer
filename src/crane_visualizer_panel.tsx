@@ -1,5 +1,5 @@
 import * as React from "react";
-import { useCallback, useLayoutEffect, useState, useEffect, useMemo } from "react";
+import { useCallback, useLayoutEffect, useState, useEffect, useMemo, useRef, StrictMode } from "react";
 import {
   PanelExtensionContext,
   SettingsTree,
@@ -11,14 +11,23 @@ import {
   Immutable
 } from "@foxglove/studio";
 import ReactDOM from "react-dom";
-import { StrictMode } from "react";
+
+// 送信データの型定義
+type MouseStateType = "DOWN" | "UP" | "MOVE" | null;
+
+interface InteractionMessage {
+  buttons: number; // MouseEvent.buttons
+  keys: string[]; // 押されているキーの配列
+  mouse_state: MouseStateType;
+  position: { x: number; y: number };
+}
 
 interface SvgPrimitiveArray {
-  layer: string; // "parent/child1/child2"のような階層パス
+  layer: string;
   svg_primitives: string[];
   config: {
     visible_by_default?: boolean;
-  }
+  };
 }
 
 interface SvgLayerArray {
@@ -44,33 +53,124 @@ const defaultConfig: PanelConfig = {
   namespaces: {},
 };
 
-
-const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context }) => {
+const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
+  context,
+}) => {
   const [viewBox, setViewBox] = useState("-5000 -3000 10000 6000");
   const [config, setConfig] = useState<PanelConfig>(defaultConfig);
   const [topic, setTopic] = useState<string>("/aggregated_svgs");
   const [topics, setTopics] = useState<undefined | Immutable<Topic[]>>();
-  const [messages, setMessages] = useState<undefined | Immutable<MessageEvent[]>>();
+  const [messages, setMessages] = useState<
+    undefined | Immutable<MessageEvent[]>
+  >();
   const [renderDone, setRenderDone] = useState<(() => void) | undefined>();
   const [recv_num, setRecvNum] = useState(0);
   const [latest_msg, setLatestMsg] = useState<SvgLayerArray>();
 
+  const [pressedKeys, setPressedKeys] = useState<Set<string>>(new Set());
+  const panStateRef = useRef<{
+    startX: number;
+    startY: number;
+    startViewBox: number[];
+  } | null>(null);
+
+  // マウスの最新情報を保存するためのref
+  const mouseInfoRef = useRef({ clientX: 0, clientY: 0, buttons: 0 });
+  // マウスの状態(DOWN/UP/MOVE)を保存するためのref
+  const mouseStateRef = useRef<MouseStateType>(null);
+
+  const svgRef = useRef<SVGSVGElement>(null);
+
+  const SEND_INTERVAL = 1000 / 60; // 16.67ms
+  const INTERACTION_TOPIC = "/input_event";
+
   const resetViewBox = useCallback(() => {
     const x = -config.viewBoxWidth / 2;
-    const aspectRatio = 0.6; // 元のアスペクト比 (6000 / 10000)
+    const aspectRatio = 0.6; // 6000 / 10000
     const height = config.viewBoxWidth * aspectRatio;
     const y = -height / 2;
     setViewBox(`${x} ${y} ${config.viewBoxWidth} ${height}`);
   }, [setViewBox, config]);
 
+  const screenToFieldCoordinate = useCallback(
+    (clientX: number, clientY: number) => {
+      if (!svgRef.current) return null;
+
+      const rect = svgRef.current.getBoundingClientRect();
+      const [vbX, vbY, vbWidth, vbHeight] = viewBox.split(" ").map(Number);
+
+      const fieldX = vbX + ((clientX - rect.left) * vbWidth) / rect.width;
+      const fieldY = vbY + ((clientY - rect.top) * vbHeight) / rect.height;
+
+      return { x: fieldX, y: fieldY };
+    },
+    [viewBox]
+  );
+
+  const sendInteraction = useCallback(
+    (data: Omit<InteractionMessage, "position">, clientX: number, clientY: number) => {
+      // 継続的に送信するループ側で送信間隔を制御するため、ここでのスロットリングは不要
+      const fieldCoord = screenToFieldCoordinate(clientX, clientY);
+      if (!fieldCoord) return;
+
+      const message: InteractionMessage = {
+        ...data,
+        position: { x: fieldCoord.x, y: fieldCoord.y },
+      };
+
+      context.publish?.(INTERACTION_TOPIC, message);
+    },
+    [screenToFieldCoordinate, context]
+  );
+
+  // 60FPSでInteractionMessageを送信し続けるためのuseEffect
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      const { clientX, clientY, buttons } = mouseInfoRef.current;
+
+      const payload = {
+        buttons,
+        keys: Array.from(pressedKeys),
+        mouse_state: mouseStateRef.current,
+      };
+
+      sendInteraction(payload, clientX, clientY);
+
+      // DOWNとUPは1フレーム限りのイベントなので、送信後にMOVE(またはnull)に戻す
+      if (mouseStateRef.current === "DOWN" || mouseStateRef.current === "UP") {
+        mouseStateRef.current = buttons > 0 ? "MOVE" : null;
+      }
+    }, SEND_INTERVAL);
+
+    return () => clearInterval(intervalId);
+  }, [pressedKeys, sendInteraction]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      setPressedKeys((prev) => new Set(prev).add(event.key));
+    };
+
+    const handleKeyUp = (event: KeyboardEvent) => {
+      setPressedKeys((prev) => {
+        const next = new Set(prev);
+        next.delete(event.key);
+        return next;
+      });
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+    };
+  }, []);
+
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.ctrlKey && event.key === "0") {
-        const x = -config.viewBoxWidth / 2;
-        const aspectRatio = 0.6; // 元のアスペクト比 (6000 / 10000)
-        const height = config.viewBoxWidth * aspectRatio;
-        const y = -height / 2;
-        setViewBox(`${x} ${y} ${config.viewBoxWidth} ${height}`);
+        resetViewBox();
       }
     };
 
@@ -79,13 +179,12 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
     return () => {
       document.removeEventListener("keydown", handleKeyDown);
     };
-  }, [resetViewBox, config]);
+  }, [resetViewBox]);
 
-  // トピックが設定されたときにサブスクライブする
   useEffect(() => {
     const subscription: Subscription = { topic: topic };
     context.subscribe([subscription]);
-  }, [topic]);
+  }, [topic, context]);
 
   useLayoutEffect(() => {
     context.saveState(config);
@@ -119,24 +218,22 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
           const path = action.payload.path.join(".");
           switch (action.action) {
             case "update":
-              if (path == "general.topic") {
+              if (path === "general.topic") {
                 setTopic(action.payload.value as string);
               } else if (path == "general.backgroundColor") {
                 setConfig((prevConfig) => ({ ...prevConfig, backgroundColor: action.payload.value as string }));
               } else if (path == "general.viewBoxWidth") {
                 setConfig((prevConfig) => ({ ...prevConfig, viewBoxWidth: action.payload.value as number }));
-              } else if (path == "general.viewBoxHeight") {
-                setConfig((prevConfig) => ({ ...prevConfig, viewBoxHeight: action.payload.value as number }));
               }
               else if (action.payload.path[0] == "namespaces") {
                 const pathParts = path.split(".");
                 const namespacePath = pathParts.slice(1, -1);
-                const leafNamespace = pathParts[pathParts.length - 1];
+                const leafNamespace = pathParts[pathParts.length - 1]!;
                 let currentNs = config.namespaces;
                 for (const ns of namespacePath) {
-                  currentNs = currentNs[ns].children || {};
+                  currentNs = currentNs[ns]!.children || {};
                 }
-                currentNs[leafNamespace].visible = action.payload.value as boolean;
+                currentNs[leafNamespace]!.visible = action.payload.value as boolean;
               }
               break;
             case "perform-node-action":
@@ -148,7 +245,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
     };
 
     updatePanelSettings();
-  }, [context, config]);
+  }, [context, config, topic]);
 
   const createNamespaceFields = (namespaces: PanelConfig["namespaces"]) => {
     const fields: { [key: string]: SettingsTreeField } = {};
@@ -171,8 +268,6 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
     return fields;
   };
 
-
-  // メッセージ受信時の処理
   useLayoutEffect(() => {
     context.onRender = (renderState, done) => {
       setRenderDone(() => done);
@@ -183,7 +278,8 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
     context.watch("topics");
     context.watch("currentFrame");
 
-  }, [context, topic]);
+    context.advertise?.(INTERACTION_TOPIC, "/input_event");
+  }, [context]);
 
   useEffect(() => {
     if (messages) {
@@ -191,9 +287,8 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
         if (message.topic === topic) {
           const msg = message.message as SvgLayerArray;
           setLatestMsg(msg);
-          setRecvNum(recv_num + 1);
+          setRecvNum((prev) => prev + 1);
 
-          // 初期化時にconfig.namespacesを設定
           setConfig((prevConfig) => {
             const newNamespaces = { ...prevConfig.namespaces };
             msg.svg_primitive_arrays.forEach((svg_primitive_array) => {
@@ -207,23 +302,11 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
         }
       }
     }
-  }, [messages]);
+  }, [messages, topic]);
 
-  // invoke the done callback once the render is complete
   useEffect(() => {
     renderDone?.();
   }, [renderDone]);
-
-  const handleCheckboxChange = (layer: string) => {
-    setConfig((prevConfig) => {
-      const newNamespaces = { ...prevConfig.namespaces };
-      if (!newNamespaces[layer]) {
-        newNamespaces[layer] = { visible: true };
-      }
-      newNamespaces[layer].visible = !newNamespaces[layer].visible;
-      return { ...prevConfig, namespaces: newNamespaces };
-    });
-  };
 
   return (
     <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column" }}>
@@ -235,27 +318,55 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
           <p>Receive num: {recv_num}</p>
         </div>
         <svg
+          ref={svgRef}
           width="100%"
           height="100%"
           viewBox={viewBox}
           style={{ backgroundColor: config.backgroundColor }}
+          // イベントハンドラは直接メッセージを送るのではなく、refに最新の状態を保存するだけ
           onMouseDown={(e) => {
-            const startX = e.clientX;
-            const startY = e.clientY;
-            const [x, y, width, height] = viewBox.split(" ").map(Number);
-            const handleMouseMove = (e: MouseEvent) => {
+            e.preventDefault();
+            mouseStateRef.current = "DOWN";
+            mouseInfoRef.current = { clientX: e.clientX, clientY: e.clientY, buttons: e.buttons };
+            
+            if (pressedKeys.size === 0) {
+              panStateRef.current = {
+                startX: e.clientX,
+                startY: e.clientY,
+                startViewBox: viewBox.split(" ").map(Number),
+              };
+            }
+          }}
+          onMouseMove={(e) => {
+            mouseInfoRef.current = { clientX: e.clientX, clientY: e.clientY, buttons: e.buttons };
+            if (mouseStateRef.current !== "DOWN") {
+              mouseStateRef.current = e.buttons > 0 ? "MOVE" : null;
+            }
+
+            if (panStateRef.current) {
+              const { startX, startY, startViewBox } = panStateRef.current;
+              const [x, y, width, height] = startViewBox;
               const dx = e.clientX - startX;
               const dy = e.clientY - startY;
-              const scaledDx = dx * width / 400;
-              const scaledDy = dy * height / 400;
+
+              const scaledDx =
+                dx * (width / (svgRef.current?.clientWidth ?? width));
+              const scaledDy =
+                dy * (height / (svgRef.current?.clientHeight ?? height));
+
               setViewBox(`${x - scaledDx} ${y - scaledDy} ${width} ${height}`);
-            };
-            const handleMouseUp = () => {
-              document.removeEventListener("mousemove", handleMouseMove);
-              document.removeEventListener("mouseup", handleMouseUp);
-            };
-            document.addEventListener("mousemove", handleMouseMove);
-            document.addEventListener("mouseup", handleMouseUp);
+            }
+          }}
+          onMouseUp={(e) => {
+            panStateRef.current = null;
+            mouseStateRef.current = "UP";
+            mouseInfoRef.current = { clientX: e.clientX, clientY: e.clientY, buttons: e.buttons };
+          }}
+          onMouseLeave={(e) => {
+            // SVG領域からマウスが出たらボタンの状態をリセット
+            mouseInfoRef.current = { clientX: e.clientX, clientY: e.clientY, buttons: 0 };
+            mouseStateRef.current = null;
+            panStateRef.current = null;
           }}
           onWheel={(e) => {
             e.preventDefault();
@@ -280,7 +391,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
         >
           {latest_msg && latest_msg.svg_primitive_arrays.map((svg_primitive_array, index) => {
             return (
-              <g key={svg_primitive_array.layer} style={{ display: config.namespaces[svg_primitive_array.layer]?.visible  ? 'block' : 'none' }}>
+              <g key={svg_primitive_array.layer} style={{ display: config.namespaces[svg_primitive_array.layer]?.visible ? 'block' : 'none' }}>
                 {svg_primitive_array.svg_primitives.map((svg_primitive, svgIndex) => (
                   <g key={svgIndex} dangerouslySetInnerHTML={{ __html: svg_primitive }} />
                 ))}
