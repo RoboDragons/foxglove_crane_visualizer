@@ -1,15 +1,15 @@
-import * as React from "react";
-import { useCallback, useLayoutEffect, useState, useEffect, useMemo, useRef, StrictMode } from "react";
 import {
+  Immutable,
+  MessageEvent,
   PanelExtensionContext,
   SettingsTree,
   SettingsTreeAction,
   SettingsTreeField,
-  MessageEvent,
-  Topic,
   Subscription,
-  Immutable
+  Topic
 } from "@foxglove/studio";
+import * as React from "react";
+import { StrictMode, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import ReactDOM from "react-dom";
 
 // 送信データの型定義
@@ -82,7 +82,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   const svgRef = useRef<SVGSVGElement>(null);
 
   const SEND_INTERVAL = 1000 / 60; // 16.67ms
-  const INTERACTION_TOPIC = "/input_event";
+  const INTERACTION_TOPIC = "/interaction_event";
 
   const resetViewBox = useCallback(() => {
     const x = -config.viewBoxWidth / 2;
@@ -95,12 +95,38 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   const screenToFieldCoordinate = useCallback(
     (clientX: number, clientY: number) => {
       if (!svgRef.current) return null;
-
+      // viewport(パネル表示域)の位置とサイズ
       const rect = svgRef.current.getBoundingClientRect();
+      // SVGのviewBoxの位置とサイズ
       const [vbX, vbY, vbWidth, vbHeight] = viewBox.split(" ").map(Number);
 
-      const fieldX = vbX + ((clientX - rect.left) * vbWidth) / rect.width;
-      const fieldY = vbY + ((clientY - rect.top) * vbHeight) / rect.height;
+      // SVGのviewBoxアスペクト比
+      const viewBoxAspect = vbWidth / vbHeight;
+      // viewport(パネル)のアスペクト比
+      const rectAspect = rect.width / rect.height;
+
+      let offsetX = 0, offsetY = 0, drawWidth = rect.width, drawHeight = rect.height;
+      
+      // アスペクト比に応じてSVGの余白を計算
+      if (rectAspect > viewBoxAspect) {
+        // 横長: 左右に余白が生じる（pillarbox）
+        drawWidth = rect.height * viewBoxAspect;
+        offsetX = (rect.width - drawWidth) / 2;
+      } else if (rectAspect < viewBoxAspect) {
+        // 縦長: 上下に余白が生じる（letterbox）
+        drawHeight = rect.width / viewBoxAspect;
+        offsetY = (rect.height - drawHeight) / 2;
+      }
+
+      // 余白を除いた実際の描画領域で座標変換
+      const normX = (clientX - rect.left - offsetX) / drawWidth;
+      const normY = (clientY - rect.top - offsetY) / drawHeight;
+
+      // 範囲外（余白部分）はnullを返す
+      if (normX < 0 || normX > 1 || normY < 0 || normY > 1) return null;
+
+      const fieldX = vbX + normX * vbWidth;
+      const fieldY = vbY + normY * vbHeight;
 
       return { x: fieldX, y: fieldY };
     },
