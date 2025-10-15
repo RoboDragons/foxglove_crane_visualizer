@@ -184,12 +184,32 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
       });
     };
 
+    // ショートカットキーによるウィンドウ切り替えなどでウィンドウが非アクティブになったときにキー状態をリセット
+    const handleWindowBlur = () => {
+      setPressedKeys(new Set());
+      // reset mouse refs
+      mouseInfoRef.current = { clientX: 0, clientY: 0, buttons: 0 };
+      mouseStateRef.current = null;
+      panStateRef.current = null;
+    };
+    
+    // タブが非表示になったときにキー状態をリセット
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        handleWindowBlur();
+      }
+    };
+
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", handleWindowBlur);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
 
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", handleWindowBlur);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, []);
 
