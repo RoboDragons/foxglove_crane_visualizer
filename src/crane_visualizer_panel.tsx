@@ -67,11 +67,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.ctrlKey && event.key === "0") {
         event.preventDefault();
-        const x = -config.viewBoxWidth / 2;
-        const aspectRatio = 0.6; // 元のアスペクト比 (6000 / 10000)
-        const height = config.viewBoxWidth * aspectRatio;
-        const y = -height / 2;
-        setViewBox(`${x} ${y} ${config.viewBoxWidth} ${height}`);
+        resetViewBox();
       } else if (event.ctrlKey && (event.key === "+" || event.key === "=")) {
         event.preventDefault();
         setViewBox((current) => {
