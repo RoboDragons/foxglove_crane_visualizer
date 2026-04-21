@@ -65,10 +65,17 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.ctrlKey && event.key === "0") {
+      const isResetShortcut = event.ctrlKey && (event.code === "Digit0" || event.code === "Numpad0");
+      const isZoomInShortcut =
+        event.ctrlKey &&
+        (event.code === "Equal" || event.code === "Semicolon" || event.code === "NumpadAdd");
+      const isZoomOutShortcut =
+        event.ctrlKey && (event.code === "Minus" || event.code === "NumpadSubtract");
+
+      if (isResetShortcut) {
         event.preventDefault();
         resetViewBox();
-      } else if (event.ctrlKey && (event.key === "+" || event.key === "=")) {
+      } else if (isZoomInShortcut) {
         event.preventDefault();
         setViewBox((current) => {
           const [x, y, width, height] = current.split(" ").map(Number);
@@ -79,7 +86,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
           const newY = y + height / 2 - newHeight / 2;
           return `${newX} ${newY} ${newWidth} ${newHeight}`;
         });
-      } else if (event.ctrlKey && event.key === "-") {
+      } else if (isZoomOutShortcut) {
         event.preventDefault();
         setViewBox((current) => {
           const [x, y, width, height] = current.split(" ").map(Number);
