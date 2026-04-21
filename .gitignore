@@ -1,4 +1,4 @@
 node_modules/
-ibisssl.foxglove-crane-visualizer-0.0.1.foxe
+*.foxe
 package-lock.json
-dist/extension.js
+dist/
