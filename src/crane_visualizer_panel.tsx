@@ -19,6 +19,9 @@ interface SvgPrimitiveArray {
   config: {
     visible_by_default?: boolean;
   }
+  config: {
+    visible_by_default?: boolean;
+  }
 }
 
 interface SvgLayerArray {
@@ -65,12 +68,38 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.ctrlKey && event.key === "0") {
-        const x = -config.viewBoxWidth / 2;
-        const aspectRatio = 0.6; // 元のアスペクト比 (6000 / 10000)
-        const height = config.viewBoxWidth * aspectRatio;
-        const y = -height / 2;
-        setViewBox(`${x} ${y} ${config.viewBoxWidth} ${height}`);
+      const isResetShortcut = event.ctrlKey && (event.code === "Digit0" || event.code === "Numpad0");
+      const isZoomInShortcut =
+        event.ctrlKey &&
+        (event.code === "Equal" || event.code === "Semicolon" || event.code === "NumpadAdd");
+      const isZoomOutShortcut =
+        event.ctrlKey && (event.code === "Minus" || event.code === "NumpadSubtract");
+
+      if (isResetShortcut) {
+        event.preventDefault();
+        resetViewBox();
+      } else if (isZoomInShortcut) {
+        event.preventDefault();
+        setViewBox((current) => {
+          const [x, y, width, height] = current.split(" ").map(Number);
+          const scale = 0.8;
+          const newWidth = width * scale;
+          const newHeight = height * scale;
+          const newX = x + width / 2 - newWidth / 2;
+          const newY = y + height / 2 - newHeight / 2;
+          return `${newX} ${newY} ${newWidth} ${newHeight}`;
+        });
+      } else if (isZoomOutShortcut) {
+        event.preventDefault();
+        setViewBox((current) => {
+          const [x, y, width, height] = current.split(" ").map(Number);
+          const scale = 1.2;
+          const newWidth = width * scale;
+          const newHeight = height * scale;
+          const newX = x + width / 2 - newWidth / 2;
+          const newY = y + height / 2 - newHeight / 2;
+          return `${newX} ${newY} ${newWidth} ${newHeight}`;
+        });
       }
     };
 
@@ -198,6 +227,8 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({ context
             const newNamespaces = { ...prevConfig.namespaces };
             msg.svg_primitive_arrays.forEach((svg_primitive_array) => {
               if (!newNamespaces[svg_primitive_array.layer]) {
+                const defaultVisibility = svg_primitive_array.config?.visible_by_default ?? true;
+                newNamespaces[svg_primitive_array.layer] = { visible: defaultVisibility };
                 const defaultVisibility = svg_primitive_array.config?.visible_by_default ?? true;
                 newNamespaces[svg_primitive_array.layer] = { visible: defaultVisibility };
               }
