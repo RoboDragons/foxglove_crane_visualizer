@@ -1,0 +1,988 @@
+import {
+  Immutable,
+  MessageEvent,
+  PanelExtensionContext,
+  ParameterValue,
+  SettingsTree,
+  SettingsTreeAction,
+  Subscription,
+  Topic,
+} from "@foxglove/studio";
+import * as React from "react";
+import {
+  StrictMode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useState,
+} from "react";
+import ReactDOM from "react-dom";
+
+const DEFAULT_TOPIC = "/ui_layout";
+const UNGROUPED_LABEL = "General";
+// int_range をドロップダウンで出す上限。これを超えたら数値入力にフォールバックする
+const MAX_RANGE_OPTIONS = 500;
+
+/** foxglove.UiControl に対応する型。proto3 のデフォルト値を埋めた正規化済みの形 */
+interface UiControl {
+  label: string;
+  kind: string;
+  parameter: string;
+  service: string;
+  payload: string;
+  choices: string[];
+  group: string;
+  labels: string[];
+  columns: number;
+  min: number;
+  max: number;
+}
+
+/** パネルに永続化する状態 */
+interface PanelState {
+  topic: string;
+  /** group 名 -> 折りたたみ中かどうか */
+  collapsed: { [group: string]: boolean };
+  /** 各コントロールの下に parameter 名を出すか（デバッグ用） */
+  showParameterNames: boolean;
+}
+
+const defaultState: PanelState = {
+  topic: DEFAULT_TOPIC,
+  collapsed: {},
+  showParameterNames: false,
+};
+
+type StatusKind = "info" | "error";
+interface Status {
+  kind: StatusKind;
+  text: string;
+}
+
+// ---------------------------------------------------------------------------
+// メッセージの正規化
+// ---------------------------------------------------------------------------
+
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((entry) => (typeof entry === "string" ? entry : String(entry)));
+}
+
+function toNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function toStringField(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+/** 受信メッセージの1コントロールを UiControl に正規化する。壊れていたら undefined */
+function normalizeControl(raw: unknown): UiControl | undefined {
+  if (raw == undefined || typeof raw !== "object") {
+    return undefined;
+  }
+  const src = raw as Record<string, unknown>;
+  const kind = toStringField(src["kind"]);
+  if (kind.length === 0) {
+    return undefined;
+  }
+  return {
+    label: toStringField(src["label"]),
+    kind,
+    parameter: toStringField(src["parameter"]),
+    service: toStringField(src["service"]),
+    payload: toStringField(src["payload"]),
+    choices: toStringArray(src["choices"]),
+    group: toStringField(src["group"]),
+    labels: toStringArray(src["labels"]),
+    columns: Math.trunc(toNumber(src["columns"], 0)),
+    min: toNumber(src["min"], 0),
+    max: toNumber(src["max"], 0),
+  };
+}
+
+/** foxglove.UiLayout メッセージから controls を取り出す。取り出せなければ undefined */
+function normalizeLayout(message: unknown): UiControl[] | undefined {
+  if (message == undefined || typeof message !== "object") {
+    return undefined;
+  }
+  const controls = (message as Record<string, unknown>)["controls"];
+  if (!Array.isArray(controls)) {
+    return undefined;
+  }
+  const normalized: UiControl[] = [];
+  for (const raw of controls) {
+    const control = normalizeControl(raw);
+    if (control) {
+      normalized.push(control);
+    }
+  }
+  return normalized;
+}
+
+/**
+ * 選択中かどうかの判定に使う文字列表現。
+ * parameter が数値型でも choices は文字列なので、必ず String() を通してから比較する。
+ */
+function valueToComparable(value: Immutable<ParameterValue>): string | undefined {
+  if (value == undefined) {
+    return undefined;
+  }
+  switch (typeof value) {
+    case "string":
+      return value;
+    case "number":
+    case "boolean":
+      return String(value);
+    default:
+      // 配列・オブジェクト・Uint8Array・Date は choices との比較対象にしない
+      return undefined;
+  }
+}
+
+function isTruthyParameter(value: Immutable<ParameterValue>): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+  if (typeof value === "string") {
+    return value.toLowerCase() === "true" || value === "1";
+  }
+  return false;
+}
+
+/** labels が使えるならそれを、駄目なら choices をそのまま表示に使う */
+function displayLabel(control: UiControl, index: number): string {
+  if (control.labels.length === control.choices.length) {
+    const label = control.labels[index];
+    if (label != undefined && label.length > 0) {
+      return label;
+    }
+  }
+  return control.choices[index] ?? "";
+}
+
+// ---------------------------------------------------------------------------
+// スタイル（Studio のライト/ダーク双方で成立するよう、半透明のグレーで組む）
+// ---------------------------------------------------------------------------
+
+/**
+ * Studio のテーマ（ライト/ダーク）を実測する。
+ *
+ * select のドロップダウン一覧はブラウザ側が描画するため、色を明示しないと
+ * 「既定の白背景 + 継承した白文字」で読めなくなる。パネルの実際の背景色から
+ * 明暗を判定し、不透明な色を明示的に当てるためのユーティリティ。
+ */
+function parseRgb(value: string): [number, number, number, number] | undefined {
+  const matched = /^rgba?\(([^)]+)\)$/.exec(value.trim());
+  if (!matched) {
+    return undefined;
+  }
+  const parts = matched[1]!.split(",").map((part) => Number(part.trim()));
+  const [r, g, b] = parts;
+  if (r == undefined || g == undefined || b == undefined) {
+    return undefined;
+  }
+  return [r, g, b, parts.length > 3 ? (parts[3] ?? 1) : 1];
+}
+
+function isDarkRgb(r: number, g: number, b: number): boolean {
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b < 128;
+}
+
+/** 祖先をたどって最初に見つかった不透明な背景色から明暗を判定する */
+function detectDarkTheme(element: HTMLElement | undefined): boolean | undefined {
+  const view = element?.ownerDocument.defaultView;
+  if (!element || !view) {
+    return undefined;
+  }
+  let node: HTMLElement | null = element;
+  while (node) {
+    const background = parseRgb(view.getComputedStyle(node).backgroundColor);
+    if (background && background[3] > 0.2) {
+      return isDarkRgb(background[0], background[1], background[2]);
+    }
+    node = node.parentElement;
+  }
+  // 背景がすべて透明なら文字色から推測する（明るい文字 = ダークテーマ）
+  const foreground = parseRgb(view.getComputedStyle(element).color);
+  if (foreground) {
+    return !isDarkRgb(foreground[0], foreground[1], foreground[2]);
+  }
+  return undefined;
+}
+
+function useIsDarkTheme(element: HTMLElement | undefined): boolean {
+  const [isDark, setIsDark] = useState(true);
+
+  useEffect(() => {
+    if (!element) {
+      return;
+    }
+    const update = () => {
+      const detected = detectDarkTheme(element);
+      if (detected != undefined) {
+        setIsDark((prev) => (prev === detected ? prev : detected));
+      }
+    };
+    update();
+
+    const doc = element.ownerDocument;
+    const observer = new MutationObserver(update);
+    observer.observe(doc.documentElement, {
+      attributes: true,
+      attributeFilter: ["class", "style", "data-theme"],
+    });
+    if (doc.body) {
+      observer.observe(doc.body, { attributes: true, attributeFilter: ["class", "style"] });
+    }
+    // Studio 側のテーマ切り替えを取りこぼしても追従できるようにする保険
+    const timer = doc.defaultView?.setInterval(update, 2000);
+
+    return () => {
+      observer.disconnect();
+      if (timer != undefined) {
+        doc.defaultView?.clearInterval(timer);
+      }
+    };
+  }, [element]);
+
+  return isDark;
+}
+
+const colors = {
+  border: "rgba(127, 127, 127, 0.4)",
+  subtleBorder: "rgba(127, 127, 127, 0.25)",
+  surface: "rgba(127, 127, 127, 0.14)",
+  surfaceStrong: "rgba(127, 127, 127, 0.22)",
+  accent: "#3b6fe0",
+  accentText: "#ffffff",
+  error: "#e05252",
+  muted: "rgba(127, 127, 127, 1)",
+};
+
+const rootStyle: React.CSSProperties = {
+  fontFamily: "inherit",
+  fontSize: 12,
+  height: "100%",
+  overflowY: "auto",
+  padding: 8,
+  boxSizing: "border-box",
+};
+
+const sectionStyle: React.CSSProperties = {
+  border: `1px solid ${colors.subtleBorder}`,
+  borderRadius: 4,
+  marginBottom: 8,
+  overflow: "hidden",
+};
+
+const sectionHeaderStyle: React.CSSProperties = {
+  alignItems: "center",
+  background: colors.surface,
+  cursor: "pointer",
+  display: "flex",
+  fontWeight: 600,
+  gap: 6,
+  padding: "6px 8px",
+  textAlign: "left",
+  width: "100%",
+};
+
+const controlRowStyle: React.CSSProperties = {
+  borderTop: `1px solid ${colors.subtleBorder}`,
+  padding: "6px 8px",
+};
+
+const controlLabelStyle: React.CSSProperties = {
+  display: "block",
+  marginBottom: 4,
+  opacity: 0.85,
+};
+
+// select のドロップダウン一覧はページの色を継承しないため、
+// 半透明 + inherit ではなく不透明色を明示する
+const inputColors = {
+  dark: { background: "#2f2f2f", color: "#e8e8e8" },
+  light: { background: "#ffffff", color: "#1a1a1a" },
+};
+
+function inputStyle(isDark: boolean): React.CSSProperties {
+  const scheme = isDark ? inputColors.dark : inputColors.light;
+  return {
+    background: scheme.background,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 3,
+    color: scheme.color,
+    // ドロップダウン一覧やスピナーなどブラウザ描画部分の配色を揃える
+    colorScheme: isDark ? "dark" : "light",
+    font: "inherit",
+    padding: "4px 6px",
+    width: "100%",
+    boxSizing: "border-box",
+  };
+}
+
+function optionStyle(isDark: boolean): React.CSSProperties {
+  const scheme = isDark ? inputColors.dark : inputColors.light;
+  return { background: scheme.background, color: scheme.color };
+}
+
+/**
+ * ボタンの見た目。
+ *
+ * <p>「状態を選ぶボタン」と「動作を起こすボタン」を見た目で区別する。
+ * 前者は parameter の現在値を映すので塗りつぶしの角丸長方形、
+ * 後者は service を呼ぶだけで状態を持たないので輪郭だけのピル型にする。
+ * 形が違えば色覚に依らず見分けられる。
+ *
+ * <p>:hover / :disabled はインラインスタイルでは書けないのでクラスにする。
+ * インラインの background はクラスより強いため、ボタンの配色はここに集約すること。
+ */
+const PANEL_CSS = `
+.rdcp-b {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  background: ${colors.surfaceStrong};
+  border: 1px solid ${colors.border};
+  border-radius: 3px;
+  padding: 5px 8px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rdcp-b:hover { background: rgba(127, 127, 127, 0.34); }
+.rdcp-b.rdcp-sel {
+  background: ${colors.accent};
+  border-color: ${colors.accent};
+  color: ${colors.accentText};
+  font-weight: 700;
+}
+.rdcp-b.rdcp-sel:hover { background: ${colors.accent}; }
+/* 動作を起こすボタン。現在値を持たないので選択状態にはならない */
+.rdcp-b.rdcp-act {
+  background: transparent;
+  border-color: rgba(127, 127, 127, 0.55);
+  border-radius: 999px;
+  padding: 5px 12px;
+}
+.rdcp-b.rdcp-act:hover { background: rgba(127, 127, 127, 0.26); }
+.rdcp-b:disabled { cursor: default; opacity: 0.45; }
+.rdcp-b:disabled:hover { background: transparent; }
+/* ON/OFF の2分割トグル。隣り合う辺の角と枠線を潰して1つの部品に見せる */
+.rdcp-seg-l { border-radius: 3px 0 0 3px; }
+.rdcp-seg-r { border-radius: 0 3px 3px 0; margin-left: -1px; }
+.rdcp-head { background: none; border: none; }
+.rdcp-head:hover { background: ${colors.surfaceStrong}; }
+`;
+
+/** 選択できるボタンのクラス名 */
+function buttonClass(selected: boolean, extra = ""): string {
+  return `rdcp-b${selected ? " rdcp-sel" : ""}${extra.length > 0 ? ` ${extra}` : ""}`;
+}
+
+// ---------------------------------------------------------------------------
+// コントロール1件の描画
+// ---------------------------------------------------------------------------
+
+interface ControlProps {
+  control: UiControl;
+  isDark: boolean;
+  currentValue: Immutable<ParameterValue>;
+  showParameterName: boolean;
+  onSetParameter: (name: string, value: ParameterValue) => void;
+}
+
+const ControlRow: React.FC<ControlProps> = ({
+  control,
+  isDark,
+  currentValue,
+  showParameterName,
+  onSetParameter,
+}) => {
+  // 数値入力は編集途中の文字列をローカルに持つ（"1." のような中間状態を許すため）
+  const [draft, setDraft] = useState<string | undefined>(undefined);
+
+  const current = valueToComparable(currentValue);
+
+  const commitNumber = useCallback(
+    (text: string) => {
+      setDraft(undefined);
+      const parsed = Number(text);
+      if (text.trim().length === 0 || !Number.isFinite(parsed)) {
+        return;
+      }
+      onSetParameter(control.parameter, parsed);
+    },
+    [control.parameter, onSetParameter],
+  );
+
+  const body = ((): React.ReactNode => {
+    switch (control.kind) {
+      case "enum": {
+        // 現在値が choices にない場合も見えるように、先頭へ暫定の選択肢を足す
+        const knownValue = current != undefined && control.choices.includes(current);
+        return (
+          <select
+            style={inputStyle(isDark)}
+            value={knownValue ? current : ""}
+            onChange={(event) => {
+              if (event.target.value.length > 0) {
+                onSetParameter(control.parameter, event.target.value);
+              }
+            }}
+          >
+            {!knownValue && (
+              <option style={optionStyle(isDark)} value="">
+                {current == undefined ? "(未設定)" : `(${current})`}
+              </option>
+            )}
+            {control.choices.map((choice, index) => (
+              <option key={`${choice}-${index}`} style={optionStyle(isDark)} value={choice}>
+                {displayLabel(control, index)}
+              </option>
+            ))}
+          </select>
+        );
+      }
+
+      case "enum_buttons": {
+        const layout: React.CSSProperties =
+          control.columns > 0
+            ? {
+                display: "grid",
+                gap: 4,
+                gridTemplateColumns: `repeat(${control.columns}, minmax(0, 1fr))`,
+              }
+            : { display: "flex", flexWrap: "wrap", gap: 4 };
+        return (
+          <div style={layout}>
+            {control.choices.map((choice, index) => {
+              const selected = current != undefined && current === choice;
+              return (
+                <button
+                  key={`${choice}-${index}`}
+                  title={choice}
+                  className={buttonClass(selected)}
+                  onClick={() => {
+                    onSetParameter(control.parameter, choice);
+                  }}
+                >
+                  {displayLabel(control, index)}
+                </button>
+              );
+            })}
+          </div>
+        );
+      }
+
+      case "bool": {
+        // 1つのボタンに "OFF" とだけ出すと「今 OFF」なのか「押すと OFF」なのか判別できない。
+        // ON/OFF を並べて現在値の側をハイライトする。値が読めないときはどちらも点かない
+        const on = currentValue == undefined ? undefined : isTruthyParameter(currentValue);
+        return (
+          <div style={{ display: "inline-flex" }}>
+            <button
+              className={buttonClass(on === true, "rdcp-seg-l")}
+              onClick={() => {
+                onSetParameter(control.parameter, true);
+              }}
+            >
+              ON
+            </button>
+            <button
+              className={buttonClass(on === false, "rdcp-seg-r")}
+              onClick={() => {
+                onSetParameter(control.parameter, false);
+              }}
+            >
+              OFF
+            </button>
+          </div>
+        );
+      }
+
+      case "number": {
+        const hasRange = control.min !== 0 || control.max !== 0;
+        return (
+          <input
+            type="number"
+            style={inputStyle(isDark)}
+            min={hasRange ? control.min : undefined}
+            max={hasRange ? control.max : undefined}
+            value={draft ?? (current ?? "")}
+            onChange={(event) => {
+              setDraft(event.target.value);
+            }}
+            onBlur={(event) => {
+              commitNumber(event.target.value);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                commitNumber(event.currentTarget.value);
+                event.currentTarget.blur();
+              }
+            }}
+          />
+        );
+      }
+
+      case "int_range": {
+        const from = Math.ceil(control.min);
+        const to = Math.floor(control.max);
+        const count = to - from + 1;
+        if (count <= 0 || count > MAX_RANGE_OPTIONS) {
+          // 範囲が不正、または広すぎる場合は数値入力で代替する
+          return (
+            <input
+              type="number"
+              style={inputStyle(isDark)}
+              min={control.min}
+              max={control.max}
+              step={1}
+              value={draft ?? (current ?? "")}
+              onChange={(event) => {
+                setDraft(event.target.value);
+              }}
+              onBlur={(event) => {
+                commitNumber(event.target.value);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  commitNumber(event.currentTarget.value);
+                  event.currentTarget.blur();
+                }
+              }}
+            />
+          );
+        }
+        const options = Array.from({ length: count }, (_, index) => from + index);
+        const knownValue =
+          current != undefined && options.some((option) => String(option) === current);
+        return (
+          <select
+            style={inputStyle(isDark)}
+            value={knownValue ? current : ""}
+            onChange={(event) => {
+              if (event.target.value.length > 0) {
+                onSetParameter(control.parameter, Number(event.target.value));
+              }
+            }}
+          >
+            {!knownValue && (
+              <option style={optionStyle(isDark)} value="">
+                {current == undefined ? "(未設定)" : `(${current})`}
+              </option>
+            )}
+            {options.map((option) => (
+              <option key={option} style={optionStyle(isDark)} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        );
+      }
+
+      default: {
+        return (
+          <div style={{ color: colors.error }}>
+            未対応の kind: &quot;{control.kind}&quot;
+          </div>
+        );
+      }
+    }
+  })();
+
+  const showHeading = control.label.length > 0;
+
+  return (
+    <div style={controlRowStyle}>
+      {showHeading && <span style={controlLabelStyle}>{control.label}</span>}
+      {body}
+      {showParameterName && control.parameter.length > 0 && (
+        <div style={{ color: colors.muted, fontSize: 10, marginTop: 3 }}>{control.parameter}</div>
+      )}
+    </div>
+  );
+};
+
+/**
+ * 連続する kind="button" をまとめて1行に詰める。
+ *
+ * <p>service を呼ぶボタンは parameter を持たないため現在値でハイライトできない。
+ * 1件ずつ行にすると縦に伸びるだけなので、折り返しありの1行に並べる。
+ */
+const ServiceButtonRow: React.FC<{
+  controls: UiControl[];
+  pending: ReadonlySet<string>;
+  onCallService: (service: string, payload: string) => void;
+}> = ({ controls, pending, onCallService }) => (
+  <div style={{ ...controlRowStyle, display: "flex", flexWrap: "wrap", gap: 4 }}>
+    {controls.map((control, index) => {
+      const busy = pending.has(control.service);
+      return (
+        <button
+          key={`${control.service}-${index}`}
+          disabled={busy}
+          title={`${control.service} ${control.payload}`.trim()}
+          className="rdcp-b rdcp-act"
+          onClick={() => {
+            onCallService(control.service, control.payload);
+          }}
+        >
+          {control.label.length > 0 ? control.label : control.service}
+        </button>
+      );
+    })}
+  </div>
+);
+
+/** group 内のコントロールを描画単位に分ける。連続する button は1行にまとめる */
+type Row =
+  | { type: "control"; control: UiControl }
+  | { type: "buttons"; controls: UiControl[] };
+
+function packRows(controls: UiControl[]): Row[] {
+  const rows: Row[] = [];
+  for (const control of controls) {
+    if (control.kind !== "button") {
+      rows.push({ type: "control", control });
+      continue;
+    }
+    const last = rows[rows.length - 1];
+    if (last?.type === "buttons") {
+      last.controls.push(control);
+    } else {
+      rows.push({ type: "buttons", controls: [control] });
+    }
+  }
+  return rows;
+}
+
+/** サービスの応答をステータス行に出せる長さに畳む */
+function summarizeResponse(response: unknown): string {
+  if (response == undefined) {
+    return "";
+  }
+  const text = typeof response === "string" ? response : JSON.stringify(response);
+  if (text == undefined) {
+    return "";
+  }
+  return text.length > 200 ? `${text.slice(0, 200)}…` : text;
+}
+
+/** 応答が {"success": false} を含むか。HTTP と違い呼び出し自体は成功して返ってくる */
+function isFailureResponse(response: unknown): boolean {
+  return (
+    typeof response === "object" &&
+    response != undefined &&
+    (response as Record<string, unknown>)["success"] === false
+  );
+}
+
+// ---------------------------------------------------------------------------
+// パネル本体
+// ---------------------------------------------------------------------------
+
+const UiControlPanel: React.FC<{ context: PanelExtensionContext }> = ({ context }) => {
+  const [state, setState] = useState<PanelState>(defaultState);
+  const [controls, setControls] = useState<UiControl[] | undefined>();
+  const [parameters, setParameters] = useState<
+    undefined | Immutable<Map<string, ParameterValue>>
+  >();
+  const [topics, setTopics] = useState<undefined | Immutable<Topic[]>>();
+  const [status, setStatus] = useState<Status | undefined>();
+  // 呼び出し中のサービス名。連打で同じ要求を積まないようにボタンを無効化する
+  const [pending, setPending] = useState<ReadonlySet<string>>(new Set());
+  const [renderDone, setRenderDone] = useState<(() => void) | undefined>();
+
+  const isDark = useIsDarkTheme(context.panelElement);
+
+  // --- Foxglove との接続 ---------------------------------------------------
+
+  useLayoutEffect(() => {
+    const savedState = context.initialState as Partial<PanelState> | undefined;
+    if (savedState) {
+      setState((prev) => ({
+        ...prev,
+        ...savedState,
+        collapsed: savedState.collapsed ?? prev.collapsed,
+      }));
+    }
+  }, [context]);
+
+  useLayoutEffect(() => {
+    context.saveState(state);
+  }, [context, state]);
+
+  useLayoutEffect(() => {
+    context.onRender = (renderState, done) => {
+      setRenderDone(() => done);
+
+      if (renderState.topics) {
+        setTopics(renderState.topics);
+      }
+      setParameters(renderState.parameters);
+
+      const frame = renderState.currentFrame;
+      if (frame && frame.length > 0) {
+        // 同一フレームに複数来たら最後のものが最新
+        for (let i = frame.length - 1; i >= 0; i--) {
+          const event = frame[i] as Immutable<MessageEvent> | undefined;
+          if (!event) {
+            continue;
+          }
+          const layout = normalizeLayout(event.message);
+          if (layout) {
+            setControls(layout);
+            break;
+          }
+        }
+      }
+    };
+
+    context.watch("topics");
+    context.watch("currentFrame");
+    context.watch("parameters");
+  }, [context]);
+
+  useEffect(() => {
+    const subscription: Subscription = { topic: state.topic };
+    context.subscribe([subscription]);
+  }, [context, state.topic]);
+
+  useEffect(() => {
+    renderDone?.();
+  }, [renderDone]);
+
+  // --- 設定ツリー -----------------------------------------------------------
+
+  useEffect(() => {
+    const panelSettings: SettingsTree = {
+      nodes: {
+        general: {
+          label: "General",
+          fields: {
+            topic: { label: "トピック名", input: "string", value: state.topic },
+            showParameterNames: {
+              label: "パラメータ名を表示",
+              input: "boolean",
+              value: state.showParameterNames,
+            },
+          },
+        },
+      },
+      actionHandler: (action: SettingsTreeAction) => {
+        if (action.action !== "update") {
+          return;
+        }
+        const path = action.payload.path.join(".");
+        if (path === "general.topic") {
+          setState((prev) => ({ ...prev, topic: action.payload.value as string }));
+        } else if (path === "general.showParameterNames") {
+          setState((prev) => ({
+            ...prev,
+            showParameterNames: action.payload.value === true,
+          }));
+        }
+      },
+    };
+    context.updatePanelSettingsEditor(panelSettings);
+  }, [context, state.showParameterNames, state.topic]);
+
+  // --- 操作ハンドラ ---------------------------------------------------------
+
+  const handleSetParameter = useCallback(
+    (name: string, value: ParameterValue) => {
+      if (name.length === 0) {
+        setStatus({ kind: "error", text: "parameter 名が空のコントロールです" });
+        return;
+      }
+      try {
+        context.setParameter(name, value);
+        setStatus({ kind: "info", text: `${name} = ${String(value)}` });
+      } catch (error) {
+        setStatus({ kind: "error", text: `${name} の設定に失敗: ${String(error)}` });
+      }
+    },
+    [context],
+  );
+
+  const handleCallService = useCallback(
+    (service: string, payload: string) => {
+      const callService = context.callService;
+      if (!callService) {
+        setStatus({
+          kind: "error",
+          text: "この接続はサービス呼び出しに対応していません",
+        });
+        return;
+      }
+      if (service.length === 0) {
+        setStatus({ kind: "error", text: "service 名が空のコントロールです" });
+        return;
+      }
+      let request: unknown = {};
+      if (payload.trim().length > 0) {
+        try {
+          request = JSON.parse(payload);
+        } catch (error) {
+          setStatus({ kind: "error", text: `payload の JSON が不正: ${String(error)}` });
+          return;
+        }
+      }
+      setStatus({ kind: "info", text: `${service} を呼び出し中…` });
+      setPending((prev) => new Set(prev).add(service));
+      const finish = () => {
+        setPending((prev) => {
+          const next = new Set(prev);
+          next.delete(service);
+          return next;
+        });
+      };
+      callService(service, request).then(
+        (response: unknown) => {
+          finish();
+          // 呼び出し自体は成功しても、応答が success:false を返すことがある
+          const summary = summarizeResponse(response);
+          setStatus({
+            kind: isFailureResponse(response) ? "error" : "info",
+            text: `${service}: ${summary.length > 0 ? summary : "OK"}`,
+          });
+        },
+        (error: unknown) => {
+          finish();
+          setStatus({ kind: "error", text: `${service} の呼び出しに失敗: ${String(error)}` });
+        },
+      );
+    },
+    [context],
+  );
+
+  const toggleGroup = useCallback((group: string) => {
+    setState((prev) => ({
+      ...prev,
+      collapsed: { ...prev.collapsed, [group]: !(prev.collapsed[group] ?? false) },
+    }));
+  }, []);
+
+  // --- group ごとにまとめる（登場順を保つ） ---------------------------------
+
+  const groups = useMemo(() => {
+    const ordered: { name: string; controls: UiControl[] }[] = [];
+    const index = new Map<string, UiControl[]>();
+    for (const control of controls ?? []) {
+      const name = control.group.length > 0 ? control.group : UNGROUPED_LABEL;
+      let bucket = index.get(name);
+      if (!bucket) {
+        bucket = [];
+        index.set(name, bucket);
+        ordered.push({ name, controls: bucket });
+      }
+      // 同じ parameter を指すコントロールが複数来るのは仕様どおりなので重複除去しない
+      bucket.push(control);
+    }
+    return ordered;
+  }, [controls]);
+
+  const topicExists = useMemo(
+    () => topics?.some((topic) => topic.name === state.topic) ?? false,
+    [state.topic, topics],
+  );
+
+  // --- 描画 -----------------------------------------------------------------
+
+  return (
+    <div style={rootStyle}>
+      <style>{PANEL_CSS}</style>
+      {controls == undefined && (
+        <div style={{ opacity: 0.7, padding: 8 }}>
+          {topicExists
+            ? `${state.topic} のメッセージを待機中…`
+            : `${state.topic} が見つかりません。データソースに接続し、設定でトピック名を確認してください。`}
+        </div>
+      )}
+
+      {controls != undefined && controls.length === 0 && (
+        <div style={{ opacity: 0.7, padding: 8 }}>{state.topic} にコントロールがありません。</div>
+      )}
+
+      {groups.map((group) => {
+        const collapsed = state.collapsed[group.name] ?? false;
+        return (
+          <div key={group.name} style={sectionStyle}>
+            <button
+              className="rdcp-b rdcp-head"
+              style={sectionHeaderStyle}
+              onClick={() => {
+                toggleGroup(group.name);
+              }}
+            >
+              <span style={{ width: 10 }}>{collapsed ? "▸" : "▾"}</span>
+              <span>{group.name}</span>
+              <span style={{ color: colors.muted, fontWeight: 400, marginLeft: "auto" }}>
+                {group.controls.length}
+              </span>
+            </button>
+            {!collapsed &&
+              packRows(group.controls).map((row, index) =>
+                row.type === "buttons" ? (
+                  <ServiceButtonRow
+                    key={`buttons-${index}`}
+                    controls={row.controls}
+                    pending={pending}
+                    onCallService={handleCallService}
+                  />
+                ) : (
+                  <ControlRow
+                    key={`${row.control.kind}-${row.control.parameter}-${index}`}
+                    control={row.control}
+                    isDark={isDark}
+                    currentValue={
+                      row.control.parameter.length > 0
+                        ? parameters?.get(row.control.parameter)
+                        : undefined
+                    }
+                    showParameterName={state.showParameterNames}
+                    onSetParameter={handleSetParameter}
+                  />
+                ),
+              )}
+          </div>
+        );
+      })}
+
+      {status && (
+        <div
+          style={{
+            color: status.kind === "error" ? colors.error : colors.muted,
+            marginTop: 4,
+            padding: "2px 4px",
+            wordBreak: "break-all",
+          }}
+        >
+          {status.text}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export function initUiControlPanel(context: PanelExtensionContext): () => void {
+  ReactDOM.render(
+    <StrictMode>
+      <UiControlPanel context={context} />
+    </StrictMode>,
+    context.panelElement,
+  );
+  return () => {
+    ReactDOM.unmountComponentAtNode(context.panelElement);
+  };
+}
