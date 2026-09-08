@@ -96,6 +96,12 @@ const normalizeUpdates = (raw: any): SvgUpdateArray | undefined => {
   }
 };
 
+// シークとみなす巻き戻り量[ms]。
+// ライブ受信でも currentTime と receiveTime は数 ms ずれるので、
+// その揺れをシークと誤判定しないだけの余裕を持たせる。
+// スナップショットは 1Hz なので、これ未満のずれは次のスナップショットで必ず整合する
+const SEEK_BACKWARD_THRESHOLD_MS = 500;
+
 // 差分をレイヤー状態へ適用する。ライブ表示とシーク時の合成で共通に使う
 const applyUpdates = (
   layers: Map<string, SvgPrimitiveArray>,
@@ -193,8 +199,13 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   // 毎フレーム「直前のスナップショット + それ以降の差分」を組み直すと、
   // 1秒分（約 40 件）の差分を毎フレーム再適用することになり極端に重い。
   const liveLayersRef = useRef<Map<string, SvgPrimitiveArray>>(new Map());
-  // 最後に適用したメッセージの時刻。巻き戻し（シーク）の検出に使う
+  // 最後に適用したメッセージの時刻（receiveTime）
   const lastAppliedTimeRef = useRef<number>(-1);
+  // 最後に見た再生時刻（currentTime）。シークの検出に使う。
+  // **メッセージ側の時刻（receiveTime）と比べないこと。**
+  // 別々の時計なのでライブ受信でも数 ms ずれ、毎フレーム「シーク」と誤判定して
+  // 履歴からの組み直しが走る（表示が 1〜2Hz まで落ちる）
+  const lastSeekTimeRef = useRef<number | undefined>(undefined);
   
   // 時間軸管理
   const [seekTime, setSeekTime] = useState<number | undefined>();
@@ -662,7 +673,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     let newestTimestamp = -1;
     for (const message of messages) {
       const timestamp = message.receiveTime.sec * 1000 + message.receiveTime.nsec / 1000000;
-      if (timestamp < lastAppliedTimeRef.current) rewound = true;
+      if (timestamp < lastAppliedTimeRef.current - SEEK_BACKWARD_THRESHOLD_MS) rewound = true;
       if (timestamp > newestTimestamp) newestTimestamp = timestamp;
 
       if (message.topic === config.aggregatedTopic) {
@@ -704,13 +715,18 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   }, [messages, config.aggregatedTopic, config.updateTopic, config.enableUpdateTopic,
       composeMessagesAtTime]);
 
-  // シークで時刻が巻き戻ったときだけ履歴から組み直す。
+  // シークで再生時刻が巻き戻ったときだけ履歴から組み直す。
   // 一時停止中のシークはメッセージが届かないので、上のエフェクトでは拾えない。
   // 前進方向は届いたメッセージを順に適用すれば足り、取りこぼしても
   // 次のスナップショット（1秒以内）で必ず整合する
   useEffect(() => {
     if (seekTime === undefined) return;
-    if (seekTime >= lastAppliedTimeRef.current) return;
+    const previousSeekTime = lastSeekTimeRef.current;
+    lastSeekTimeRef.current = seekTime;
+    if (previousSeekTime === undefined) return;
+    // 判定は currentTime 同士で行う。receiveTime と比べると別の時計を突き合わせることになる
+    if (seekTime >= previousSeekTime - SEEK_BACKWARD_THRESHOLD_MS) return;
+
     const composed = composeMessagesAtTime(seekTime);
     liveLayersRef.current = new Map(
       (composed?.svg_primitive_arrays ?? []).map((array) => [array.layer, array])
