@@ -341,17 +341,19 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
         }
       }
       
-      // 結果をSvgLayerArray形式に変換（空のレイヤーは除外）
+      // 結果をSvgLayerArray形式に変換する。
+      // 中身が空のレイヤーも残すこと。サーバーは「出たり消えたりさせない」ために
+      // 空のレイヤーを意図的に作っており、ここで捨てるとレイヤー表示切替の一覧から
+      // 消えてしまう（スナップショットだけを描く経路とも挙動が食い違う）
       const result: SvgLayerArray = {
         svg_primitive_arrays: Array.from(layerMap.entries())
-          .filter(([_, primitives]) => primitives.length > 0)
           .map(([layer, primitives]) => ({
             layer,
             svg_primitives: primitives,
             config: layerConfigs.get(layer)
           }))
       };
-      
+
       // aggregated が無く、適用後も何も残らない場合は undefined を返す
       if (!latestAggregatedMsg && result.svg_primitive_arrays.length === 0) {
         return undefined;
@@ -365,8 +367,18 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
 
   // 履歴クリーンアップ関数
   const cleanupHistory = useCallback(() => {
-    const now = Date.now();
-    const cutoffTime = now - (config.maxHistoryDuration * 1000);
+    // 基準はメッセージ側の時刻（receiveTime）であって実時間ではない。
+    // Date.now() を使うと、MCAP の再生中は記録時刻が過去にあるため
+    // 履歴が毎回まるごと捨てられ、スナップショットが来るまで絵が欠ける。
+    let latestTimestamp = -1;
+    for (const [timestamp] of aggregatedMessages) {
+      if (timestamp > latestTimestamp) latestTimestamp = timestamp;
+    }
+    for (const [timestamp] of updateMessages) {
+      if (timestamp > latestTimestamp) latestTimestamp = timestamp;
+    }
+    if (latestTimestamp < 0) return;  // まだ何も受け取っていない
+    const cutoffTime = latestTimestamp - (config.maxHistoryDuration * 1000);
     
     // aggregatedMessagesのクリーンアップ
     setAggregatedMessages(prev => {
@@ -395,7 +407,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
       });
       return filtered;
     });
-  }, [config.maxHistoryDuration, config.maxHistorySize]);
+  }, [aggregatedMessages, updateMessages, config.maxHistoryDuration, config.maxHistorySize]);
 
   // 定期的なクリーンアップ
   useEffect(() => {
