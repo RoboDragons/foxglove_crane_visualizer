@@ -96,6 +96,48 @@ const normalizeUpdates = (raw: any): SvgUpdateArray | undefined => {
   }
 };
 
+// 差分をレイヤー状態へ適用する。ライブ表示とシーク時の合成で共通に使う
+const applyUpdates = (
+  layers: Map<string, SvgPrimitiveArray>,
+  updateArray: SvgUpdateArray
+): void => {
+  for (const update of updateArray.updates ?? []) {
+    if (!update || !update.layer || !update.operation) continue;
+    const current = layers.get(update.layer);
+    switch (update.operation) {
+      case "replace":
+        if (Array.isArray(update.svg_primitives)) {
+          layers.set(update.layer, {
+            layer: update.layer,
+            svg_primitives: update.svg_primitives,
+            config: current?.config,
+          });
+        }
+        break;
+      case "append":
+        if (Array.isArray(update.svg_primitives)) {
+          layers.set(update.layer, {
+            layer: update.layer,
+            svg_primitives: [...(current?.svg_primitives ?? []), ...update.svg_primitives],
+            config: current?.config,
+          });
+        }
+        break;
+      case "clear":
+        // レイヤー自体は残す。消すと表示切替の一覧から消えてしまう
+        layers.set(update.layer, {
+          layer: update.layer,
+          svg_primitives: [],
+          config: current?.config,
+        });
+        break;
+      default:
+        console.warn(`Unknown operation: ${update.operation}`);
+        break;
+    }
+  }
+};
+
 interface PanelConfig {
   backgroundColor: string;
   message: string;
@@ -120,8 +162,10 @@ const defaultConfig: PanelConfig = {
   aggregatedTopic: "/aggregated_svgs",
   updateTopic: "/visualizer_svgs",
   enableUpdateTopic: true,
-  maxHistoryDuration: 300, // 5分間
-  maxHistorySize: 1000, // 最大1000メッセージ
+  // 差分は毎秒 40 件前後・1件 30KB 程度届く。履歴はシークの起点を確保するためだけの
+  // ものなので短くてよい（スナップショットが 1Hz で来るため数秒あれば足りる）
+  maxHistoryDuration: 30, // 30秒間
+  maxHistorySize: 300, // 最大300メッセージ
   namespaces: {},
 };
 
@@ -138,10 +182,19 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   const [recv_num, setRecvNum] = useState(0);
   const [latest_msg, setLatestMsg] = useState<SvgLayerArray>();
   
-  // 複数トピックのメッセージ履歴管理
-  const [aggregatedMessages, setAggregatedMessages] = useState<Map<number, MessageEvent>>(new Map());
+  // 複数トピックのメッセージ履歴。**state ではなく ref で持つ。**
+  // 毎秒 40 件前後届くので state にすると1メッセージごとに再描画と Map のコピーが走り、
+  // パネルが配信レートに追いつけなくなる。履歴を読むのはシークのときだけなので、
+  // 描画のトリガにする必要が無い。
+  const aggregatedMessagesRef = useRef<Map<number, MessageEvent>>(new Map());
   // 同一ミリ秒に複数の更新が来る可能性に対応するため配列で保持
-  const [updateMessages, setUpdateMessages] = useState<Map<number, MessageEvent[]>>(new Map());
+  const updateMessagesRef = useRef<Map<number, MessageEvent[]>>(new Map());
+  // ライブ表示用に差分を適用し続けるレイヤー状態。
+  // 毎フレーム「直前のスナップショット + それ以降の差分」を組み直すと、
+  // 1秒分（約 40 件）の差分を毎フレーム再適用することになり極端に重い。
+  const liveLayersRef = useRef<Map<string, SvgPrimitiveArray>>(new Map());
+  // 最後に適用したメッセージの時刻。巻き戻し（シーク）の検出に使う
+  const lastAppliedTimeRef = useRef<number>(-1);
   
   // 時間軸管理
   const [seekTime, setSeekTime] = useState<number | undefined>();
@@ -170,7 +223,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     const height = config.viewBoxWidth * aspectRatio;
     const y = -height / 2;
     setViewBox(`${x} ${y} ${config.viewBoxWidth} ${height}`);
-  }, [setViewBox, config]);
+  }, [config.viewBoxWidth]);
 
   const screenToFieldCoordinate = useCallback(
     (clientX: number, clientY: number) => {
@@ -251,169 +304,93 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     return () => clearInterval(intervalId);
   }, [pressedKeys, sendInteraction]);
 
-  // seekTimeに基づいてメッセージを合成する関数
+  // 指定時刻の絵を履歴から組み直す。**シークのときだけ呼ぶ。**
+  // 通常の再生ではこの経路を通さず、届いた差分をそのまま liveLayersRef へ適用する。
   const composeMessagesAtTime = useCallback((targetTime: number): SvgLayerArray | undefined => {
     try {
-      // 直前のaggregatedメッセージを検索
+      // 直前のスナップショットを探す（差分はこれを起点にしないと組み立たない）
       let latestAggregatedTime = -1;
       let latestAggregatedMsg: SvgLayerArray | undefined;
-      
-      for (const [timestamp, message] of aggregatedMessages) {
+      for (const [timestamp, message] of aggregatedMessagesRef.current) {
         if (timestamp <= targetTime && timestamp > latestAggregatedTime) {
           latestAggregatedTime = timestamp;
           latestAggregatedMsg = normalizeSnapshot(message.message);
         }
       }
-      
-      // ベースとなるレイヤーデータをコピー（バリデーション付き）
-      const layerMap = new Map<string, string[]>();
-      // レイヤーごとの config（visible_by_default）はスナップショットにしか載らないので別に持つ
-      const layerConfigs = new Map<string, SvgLayerConfig | undefined>();
-      if (latestAggregatedMsg && latestAggregatedMsg.svg_primitive_arrays) {
-        latestAggregatedMsg.svg_primitive_arrays.forEach(array => {
-          if (array && array.layer && Array.isArray(array.svg_primitives)) {
-            layerMap.set(array.layer, [...array.svg_primitives]);
-            layerConfigs.set(array.layer, array.config);
-          }
-        });
-      }
-      
+
+      const layers = new Map<string, SvgPrimitiveArray>();
+      latestAggregatedMsg?.svg_primitive_arrays.forEach((array) => {
+        if (array && array.layer && Array.isArray(array.svg_primitives)) {
+          layers.set(array.layer, array);
+        }
+      });
+
       if (!config.enableUpdateTopic) {
-        // updateトピックが無効の場合はaggregatedのみ返す
         return latestAggregatedMsg;
       }
-      
-      // 適用対象となるupdateメッセージを抽出
-      const relevantUpdates: Array<[number, SvgUpdateArray]> = [];
-      for (const [timestamp, messagesAtTs] of updateMessages) {
-        // latestAggregatedMsg がない場合は履歴の最古から targetTime 以下を採用
-        // ある場合は aggregated の直後から targetTime 以下を採用
-        const lowerBound = latestAggregatedMsg ? latestAggregatedTime : Number.NEGATIVE_INFINITY;
-        if (timestamp > lowerBound && timestamp <= targetTime) {
-          for (const message of messagesAtTs) {
-            try {
-              const updateArray = normalizeUpdates(message.message);
-              if (updateArray) relevantUpdates.push([timestamp, updateArray]);
-            } catch (error) {
-              console.warn(`Invalid update message at timestamp ${timestamp}:`, error);
-            }
-          }
-        }
-      }
-      
-      // 時間順でソート
-      relevantUpdates.sort((a, b) => a[0] - b[0]);
-      
-      // 更新を順次適用
-      for (const [timestamp, updateArray] of relevantUpdates) {
-        if (!updateArray.updates) continue;
-        
-        for (const update of updateArray.updates) {
-          if (!update || !update.layer || !update.operation) {
-            console.warn(`Invalid update in message at timestamp ${timestamp}:`, update);
-            continue;
-          }
-          
-          const currentPrimitives = layerMap.get(update.layer) || [];
-          
-          // フォールバック時（aggregated 不在）には replace/clear のみ適用。append は無視。
-          switch (update.operation) {
-            case "replace":
-              if (Array.isArray(update.svg_primitives)) {
-                layerMap.set(update.layer, [...update.svg_primitives]);
-              }
-              break;
-            case "append":
-              if (latestAggregatedMsg) {
-                if (Array.isArray(update.svg_primitives)) {
-                  layerMap.set(update.layer, [...currentPrimitives, ...update.svg_primitives]);
-                }
-              }
-              break;
-            case "clear":
-              // ベースがなくても clear 自体は適用可能（結果は空レイヤー）
-              layerMap.set(update.layer, []);
-              break;
-            default:
-              console.warn(`Unknown operation: ${update.operation}`);
-              break;
-          }
-        }
-      }
-      
-      // 結果をSvgLayerArray形式に変換する。
-      // 中身が空のレイヤーも残すこと。サーバーは「出たり消えたりさせない」ために
-      // 空のレイヤーを意図的に作っており、ここで捨てるとレイヤー表示切替の一覧から
-      // 消えてしまう（スナップショットだけを描く経路とも挙動が食い違う）
-      const result: SvgLayerArray = {
-        svg_primitive_arrays: Array.from(layerMap.entries())
-          .map(([layer, primitives]) => ({
-            layer,
-            svg_primitives: primitives,
-            config: layerConfigs.get(layer)
-          }))
-      };
 
-      // aggregated が無く、適用後も何も残らない場合は undefined を返す
-      if (!latestAggregatedMsg && result.svg_primitive_arrays.length === 0) {
+      // スナップショットの直後から targetTime までの差分を時間順に適用する。
+      // スナップショットが無い場合は履歴の最古から拾う
+      const lowerBound = latestAggregatedMsg ? latestAggregatedTime : Number.NEGATIVE_INFINITY;
+      const relevant: Array<[number, MessageEvent[]]> = [];
+      for (const [timestamp, messagesAtTs] of updateMessagesRef.current) {
+        if (timestamp > lowerBound && timestamp <= targetTime) {
+          relevant.push([timestamp, messagesAtTs]);
+        }
+      }
+      relevant.sort((a, b) => a[0] - b[0]);
+      for (const [timestamp, messagesAtTs] of relevant) {
+        for (const message of messagesAtTs) {
+          try {
+            const updateArray = normalizeUpdates(message.message);
+            if (updateArray) applyUpdates(layers, updateArray);
+          } catch (error) {
+            console.warn(`Invalid update message at timestamp ${timestamp}:`, error);
+          }
+        }
+      }
+
+      // スナップショットが無く、適用しても何も残らないなら描くものが無い
+      if (!latestAggregatedMsg && layers.size === 0) {
         return undefined;
       }
-      return result;
+      return { svg_primitive_arrays: Array.from(layers.values()) };
     } catch (error) {
       console.error('Error in composeMessagesAtTime:', error);
       return undefined;
     }
-  }, [aggregatedMessages, updateMessages, config.enableUpdateTopic]);
+  }, [config.enableUpdateTopic]);
 
-  // 履歴クリーンアップ関数
+  // 履歴クリーンアップ関数。
+  // 依存はプリミティブだけにすること。履歴の Map を依存に入れると
+  // 下の setInterval が毎メッセージ張り直されて**一度も発火しなくなる**
   const cleanupHistory = useCallback(() => {
     // 基準はメッセージ側の時刻（receiveTime）であって実時間ではない。
     // Date.now() を使うと、MCAP の再生中は記録時刻が過去にあるため
     // 履歴が毎回まるごと捨てられ、スナップショットが来るまで絵が欠ける。
-    let latestTimestamp = -1;
-    for (const [timestamp] of aggregatedMessages) {
-      if (timestamp > latestTimestamp) latestTimestamp = timestamp;
-    }
-    for (const [timestamp] of updateMessages) {
-      if (timestamp > latestTimestamp) latestTimestamp = timestamp;
-    }
+    const latestTimestamp = lastAppliedTimeRef.current;
     if (latestTimestamp < 0) return;  // まだ何も受け取っていない
     const cutoffTime = latestTimestamp - (config.maxHistoryDuration * 1000);
-    
-    // aggregatedMessagesのクリーンアップ
-    setAggregatedMessages(prev => {
-      const filtered = new Map();
-      const entries = Array.from(prev.entries())
+
+    const trim = (map: Map<number, unknown>) => {
+      const kept = Array.from(map.entries())
         .filter(([timestamp]) => timestamp >= cutoffTime)
-        .sort(([a], [b]) => b - a) // 新しい順にソート
-        .slice(0, config.maxHistorySize); // 最大サイズで制限
-      
-      entries.forEach(([timestamp, message]) => {
-        filtered.set(timestamp, message);
-      });
-      
-      return filtered;
-    });
-    
-    // updateMessagesのクリーンアップ（配列保持）
-    setUpdateMessages(prev => {
-      const filtered = new Map<number, MessageEvent[]>();
-      const entries = Array.from(prev.entries())
-        .filter(([timestamp]) => timestamp >= cutoffTime)
-        .sort(([a], [b]) => b - a)
-        .slice(0, config.maxHistorySize);
-      entries.forEach(([timestamp, msgs]) => {
-        filtered.set(timestamp, msgs);
-      });
-      return filtered;
-    });
-  }, [aggregatedMessages, updateMessages, config.maxHistoryDuration, config.maxHistorySize]);
+        .sort(([a], [b]) => b - a)          // 新しい順にソート
+        .slice(0, config.maxHistorySize);   // 最大サイズで制限
+      map.clear();
+      for (const [timestamp, value] of kept) {
+        map.set(timestamp, value);
+      }
+    };
+    trim(aggregatedMessagesRef.current as Map<number, unknown>);
+    trim(updateMessagesRef.current as Map<number, unknown>);
+  }, [config.maxHistoryDuration, config.maxHistorySize]);
 
   // 定期的なクリーンアップ
   useEffect(() => {
     const interval = setInterval(() => {
       cleanupHistory();
-    }, 30000); // 30秒ごとにクリーンアップ
+    }, 5000); // 5秒ごとにクリーンアップ
     
     return () => clearInterval(interval);
   }, [cleanupHistory]);
@@ -671,110 +648,99 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     context.advertise?.(INTERACTION_TOPIC, "/input_event");
   }, [context]);
 
+  // 受信メッセージを履歴に積み、ライブ表示用のレイヤー状態へ差分を適用する。
+  //
+  // **毎フレーム履歴から組み直さないこと。** スナップショットは 1Hz なので、
+  // 組み直すと1秒分（約 40 件）の差分を毎フレーム再適用することになり、
+  // パネルの表示レートが 2Hz 程度まで落ちる。
+  // 届いたメッセージを順に適用すれば O(変化したレイヤー) で済む。
   useEffect(() => {
-    if (messages) {
-      for (const message of messages) {
-        // 履歴のキーは受信時刻（ミリ秒）。合成時の時間順の並べ替えに使う
-        const timestamp = message.receiveTime.sec * 1000 + message.receiveTime.nsec / 1000000;
+    if (!messages || messages.length === 0) return;
 
+    // まず履歴に積む（シーク時の組み直しに使う）
+    let rewound = false;
+    let newestTimestamp = -1;
+    for (const message of messages) {
+      const timestamp = message.receiveTime.sec * 1000 + message.receiveTime.nsec / 1000000;
+      if (timestamp < lastAppliedTimeRef.current) rewound = true;
+      if (timestamp > newestTimestamp) newestTimestamp = timestamp;
+
+      if (message.topic === config.aggregatedTopic) {
+        aggregatedMessagesRef.current.set(timestamp, message);
+      } else if (config.enableUpdateTopic && message.topic === config.updateTopic) {
+        const existing = updateMessagesRef.current.get(timestamp);
+        if (existing) existing.push(message);
+        else updateMessagesRef.current.set(timestamp, [message]);
+      }
+    }
+
+    if (rewound) {
+      // シークで時刻が巻き戻った。差分の積み上げは当てにならないので履歴から組み直す
+      const composed = composeMessagesAtTime(newestTimestamp);
+      liveLayersRef.current = new Map(
+        (composed?.svg_primitive_arrays ?? []).map((array) => [array.layer, array])
+      );
+    } else {
+      for (const message of messages) {
         if (message.topic === config.aggregatedTopic) {
           const msg = normalizeSnapshot(message.message);
-
-          // スナップショットの履歴を保存する（シーク時の合成の起点になる）
-          setAggregatedMessages((prev) => new Map(prev).set(timestamp, message));
-
-          if (msg) setLatestMsg(msg);
-          setRecvNum((prev) => prev + 1);
-
-          // レイヤーの初期表示状態は visible_by_default に従う（フォーク独自機能）
-          setConfig((prevConfig) => {
-            const newNamespaces = { ...prevConfig.namespaces };
-            msg?.svg_primitive_arrays.forEach((svg_primitive_array) => {
-              if (!newNamespaces[svg_primitive_array.layer]) {
-                const defaultVisibility = svg_primitive_array.config?.visible_by_default ?? true;
-                newNamespaces[svg_primitive_array.layer] = { visible: defaultVisibility };
-              }
-            });
-            return { ...prevConfig, namespaces: newNamespaces };
-          });
+          if (msg) {
+            setLatestMsg(msg);
+            // スナップショットはレイヤー全体の置き換え
+            liveLayersRef.current = new Map(
+              msg.svg_primitive_arrays.map((array) => [array.layer, array])
+            );
+          }
         } else if (config.enableUpdateTopic && message.topic === config.updateTopic) {
-          // 差分更新の履歴を保存する（同一ミリ秒に複数届くことがあるので配列で持つ）
-          setUpdateMessages((prev) => {
-            const map = new Map(prev);
-            const arr = [...(map.get(timestamp) ?? []), message];
-            map.set(timestamp, arr);
-            return map;
-          });
-          setRecvNum((prev) => prev + 1);
+          const updateArray = normalizeUpdates(message.message);
+          if (updateArray) applyUpdates(liveLayersRef.current, updateArray);
         }
       }
     }
-  }, [messages, config.aggregatedTopic, config.updateTopic, config.enableUpdateTopic]);
 
-  // seekTimeが変更された時のメッセージ合成処理
-  useEffect(() => {
-    if (seekTime !== undefined) {
-      const composedMsg = composeMessagesAtTime(seekTime);
-      setCurrentDisplayMsg(composedMsg);
-      
-      // ネームスペースの初期化
-      if (composedMsg) {
-        setConfig((prevConfig) => {
-          const newNamespaces = { ...prevConfig.namespaces };
-          composedMsg.svg_primitive_arrays.forEach((svg_primitive_array) => {
-            if (!newNamespaces[svg_primitive_array.layer]) {
-              const defaultVisibility = svg_primitive_array.config?.visible_by_default ?? true;
-              newNamespaces[svg_primitive_array.layer] = { visible: defaultVisibility };
-            }
-          });
-          return { ...prevConfig, namespaces: newNamespaces };
-        });
-      }
-    }
-  }, [seekTime, composeMessagesAtTime]);
+    lastAppliedTimeRef.current = newestTimestamp;
+    setRecvNum((prev) => prev + messages.length);
+    setCurrentDisplayMsg({ svg_primitive_arrays: Array.from(liveLayersRef.current.values()) });
+  }, [messages, config.aggregatedTopic, config.updateTopic, config.enableUpdateTopic,
+      composeMessagesAtTime]);
 
-  // リアルタイム更新用：メッセージ到着時に最新時刻で合成（シーク未実行時）
+  // シークで時刻が巻き戻ったときだけ履歴から組み直す。
+  // 一時停止中のシークはメッセージが届かないので、上のエフェクトでは拾えない。
+  // 前進方向は届いたメッセージを順に適用すれば足り、取りこぼしても
+  // 次のスナップショット（1秒以内）で必ず整合する
   useEffect(() => {
-    if (!config.enableUpdateTopic) return;
-    if (seekTime !== undefined) return; // シーク中は上のエフェクトに任せる
-    // 最新のタイムスタンプを選択
-    let latestTs = -1;
-    for (const [ts] of aggregatedMessages) {
-      if (ts > latestTs) latestTs = ts;
-    }
-    for (const [ts] of updateMessages) {
-      if (ts > latestTs) latestTs = ts;
-    }
-    if (latestTs >= 0) {
-      const composed = composeMessagesAtTime(latestTs);
-      setCurrentDisplayMsg(composed);
-    }
-  }, [messages, aggregatedMessages, updateMessages, seekTime, config.enableUpdateTopic, composeMessagesAtTime]);
-
-  // シーク時（currentTime 定義時）も、メッセージ到着で同じ時刻の合成を更新
-  useEffect(() => {
-    if (!config.enableUpdateTopic) return;
     if (seekTime === undefined) return;
+    if (seekTime >= lastAppliedTimeRef.current) return;
     const composed = composeMessagesAtTime(seekTime);
+    liveLayersRef.current = new Map(
+      (composed?.svg_primitive_arrays ?? []).map((array) => [array.layer, array])
+    );
+    lastAppliedTimeRef.current = seekTime;
     setCurrentDisplayMsg(composed);
-  }, [messages, aggregatedMessages, updateMessages, seekTime, config.enableUpdateTopic, composeMessagesAtTime]);
+  }, [seekTime, composeMessagesAtTime]);
 
   useEffect(() => {
     renderDone?.();
   }, [renderDone]);
 
   // currentDisplayMsg に含まれる新規レイヤーを namespaces に反映
+  //
+  // **新しいレイヤーが無いフレームでは prevConfig をそのまま返すこと。**
+  // 毎回新しいオブジェクトを返すと config が毎フレーム変化し、
+  // context.saveState() が毎フレーム走って描画が止まる。
   useEffect(() => {
     if (!currentDisplayMsg) return;
     setConfig((prevConfig) => {
+      let added = false;
       const newNamespaces = { ...prevConfig.namespaces };
       currentDisplayMsg.svg_primitive_arrays.forEach((svg_primitive_array) => {
         if (!newNamespaces[svg_primitive_array.layer]) {
           const defaultVisibility = svg_primitive_array.config?.visible_by_default ?? true;
           newNamespaces[svg_primitive_array.layer] = { visible: defaultVisibility };
+          added = true;
         }
       });
-      return { ...prevConfig, namespaces: newNamespaces };
+      return added ? { ...prevConfig, namespaces: newNamespaces } : prevConfig;
     });
   }, [currentDisplayMsg]);
 
@@ -787,7 +753,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
         </div>
         <div>
           <p>Receive num: {recv_num}</p>
-          <p>History: Aggregated({aggregatedMessages.size}), Updates({updateMessages.size})</p>
+          <p>History: Aggregated({aggregatedMessagesRef.current.size}), Updates({updateMessagesRef.current.size})</p>
           {seekTime !== undefined && <p>Seek Time: {new Date(seekTime).toISOString()}</p>}
         </div>
         <svg
