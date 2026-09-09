@@ -16,7 +16,10 @@ TAG="$(git rev-parse --short HEAD)-$(date +%m%d-%H%M)"
 sed -i "s/^const BUILD_TAG = \".*\";/const BUILD_TAG = \"${TAG}\";/" src/crane_visualizer_panel.tsx
 
 $NODE node_modules/typescript/bin/tsc --noEmit
-$NODE "$CLI" build
+# **本番ビルドを明示すること。** 既定は development で、React の開発ビルド
+# （react-dom.development.js）と eval-source-map が入る。実測で 84 プリミティブ
+# あたり約 1.5 ms の上乗せがあった
+$NODE "$CLI" build --mode production
 $NODE "$CLI" install >/dev/null
 
 # Windows 版 Studio 用。存在するときだけコピーする
