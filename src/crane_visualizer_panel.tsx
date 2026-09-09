@@ -113,6 +113,12 @@ const replaceLayersIfNotEmpty = (
   return true;
 };
 
+// ビルド識別子。**ビルドのたびに build.sh が書き換える。**
+// 「直したはずなのに反映されていない」を一目で判別するためにパネル上部へ出す。
+// 拡張のインストールはビルドを伴わず、入れ先も実行環境のホームなので、
+// 古いビルドが黙って読まれることが実際に何度も起きた。
+const BUILD_TAG = "93f91fd-0909-1504";
+
 // シークとみなす巻き戻り量[ms]。
 // ライブ受信でも currentTime と receiveTime は数 ms ずれるので、
 // その揺れをシークと誤判定しないだけの余裕を持たせる。
@@ -879,6 +885,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column" }}>
       <div style={{ width: "100%", height: "100%", overflow: "hidden" }}>
         <div>
+          <p>Build: {BUILD_TAG}</p>
           <p>Aggregated Topic: {config.aggregatedTopic}</p>
           {config.enableUpdateTopic && <p>Update Topic: {config.updateTopic}</p>}
         </div>
