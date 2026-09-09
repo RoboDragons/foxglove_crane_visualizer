@@ -129,7 +129,7 @@ const joinedHtml = (primitives: string[]): string => {
 // 「直したはずなのに反映されていない」を一目で判別するためにパネル上部へ出す。
 // 拡張のインストールはビルドを伴わず、入れ先も実行環境のホームなので、
 // 古いビルドが黙って読まれることが実際に何度も起きた。
-const BUILD_TAG = "87cec66-0909-1531";
+const BUILD_TAG = "7597301-0909-1545";
 
 // シークとみなす巻き戻り量[ms]。
 // ライブ受信でも currentTime と receiveTime は数 ms ずれるので、
@@ -264,9 +264,11 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   // done() を返すまで Studio は次のフレームを渡さないので、後者が長いほど前者が落ちる。
   const perfRef = useRef({
     frameStartMs: 0,
-    commitEndMs: 0,
+    lastCommitMs: 0,             // このフレームで最後にコミットが終わった時刻
+    layoutSumMs: 0,              // このフレームで強制レイアウトに費やした合計[ms]
     intervals: [] as number[],   // onRender の間隔[ms]
-    durations: [] as number[],   // onRender → React のコミット完了[ms]
+    durations: [] as number[],   // onRender → 最後のコミット完了[ms]
+    layouts: [] as number[],     // うちスタイル再計算＋レイアウト[ms]
     frames: [] as number[],      // onRender → 次のアニメーションフレーム[ms]（＝ブラウザの描画込み）
     primitives: 0,               // 直近フレームのプリミティブ総数
     visiblePrimitives: 0,        // うち表示中のレイヤーのもの
@@ -873,17 +875,36 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     setCurrentDisplayMsg({ svg_primitive_arrays: Array.from(liveLayersRef.current.values()) });
   }, [seekTime, composeMessagesAtTime]);
 
+  // 毎コミット後に走る（依存配列なし）。
+  //
+  // **1フレームに1回ではない。** onRender は setState を4回続けて呼び、
+  // React 17 の legacy モードでは React 外からの setState はバッチされないので、
+  // 1フレームで4〜5回コミットが起きる。最初のコミットだけを測ると
+  // 本命の DOM 更新が paint 側に紛れ込むため、最後のコミット時刻を持ち回る。
+  //
+  // getBoundingClientRect でスタイル再計算とレイアウトを同期的に走らせ、その分を
+  // 切り出して測る。ブラウザ任せにすると paint と混ざって区別が付かない。
+  useLayoutEffect(() => {
+    const t0 = performance.now();
+    svgRef.current?.getBoundingClientRect();
+    const t1 = performance.now();
+    perfRef.current.lastCommitMs = t1;
+    perfRef.current.layoutSumMs += t1 - t0;
+  });
+
   useEffect(() => {
     if (renderDone && perfRef.current.frameStartMs > 0) {
-      const commitEndMs = performance.now();
-      perfRef.current.commitEndMs = commitEndMs;
-      pushSample(perfRef.current.durations, commitEndMs - perfRef.current.frameStartMs);
       perfRef.current.domNodes = svgRef.current?.getElementsByTagName("*").length ?? 0;
 
-      // 次のアニメーションフレームまで＝ブラウザがこのコミットを
-      // レイアウト・描画し終えて戻ってくるまで。React のコミット時間には含まれない
+      // 次のアニメーションフレームまで＝ブラウザがこのフレームを
+      // 描画し終えて戻ってくるまで。この時点でこのフレームのコミットは全部済んでいる
       const startMs = perfRef.current.frameStartMs;
-      requestAnimationFrame(() => pushSample(perfRef.current.frames, performance.now() - startMs));
+      requestAnimationFrame(() => {
+        pushSample(perfRef.current.frames, performance.now() - startMs);
+        pushSample(perfRef.current.durations, perfRef.current.lastCommitMs - startMs);
+        pushSample(perfRef.current.layouts, perfRef.current.layoutSumMs);
+        perfRef.current.layoutSumMs = 0;
+      });
     }
     renderDone?.();
   }, [renderDone]);
@@ -924,6 +945,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
             Panel: {(() => { const i = average(perfRef.current.intervals); return i > 0 ? (1000 / i).toFixed(1) : "-"; })()} fps
             {" / interval "}{average(perfRef.current.intervals).toFixed(1)} ms
             {" = react "}{average(perfRef.current.durations).toFixed(1)}
+            {" (layout "}{average(perfRef.current.layouts).toFixed(1)}{")"}
             {" + paint "}{Math.max(0, average(perfRef.current.frames) - average(perfRef.current.durations)).toFixed(1)}
             {" + wait "}{Math.max(0, average(perfRef.current.intervals) - average(perfRef.current.frames)).toFixed(1)} ms
           </p>
