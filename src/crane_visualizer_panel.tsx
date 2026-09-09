@@ -5,11 +5,10 @@ import {
   SettingsTree,
   SettingsTreeAction,
   SettingsTreeField,
-  Subscription,
-  Topic
+  Subscription
 } from "@foxglove/studio";
 import * as React from "react";
-import { StrictMode, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { StrictMode, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactDOM from "react-dom";
 
 // 送信データの型定義
@@ -125,6 +124,16 @@ const joinedHtml = (primitives: string[]): string => {
   return html;
 };
 
+// 診断表示。**毎フレーム更新しないこと。**
+//
+// 表示するのは数字だけだが、テキストを毎フレーム書き換えると SVG と同じ
+// レイアウトツリーが毎フレーム汚れる。実測では SVG を空（DOM 0 ノード）にしても
+// react が 4.1ms 残っており、その大半がこの表示自身だった。
+// props を1秒に1回しか変えないことで、それ以外のフレームは React ごと素通しする。
+const PanelStats = memo(function PanelStats({ lines }: { lines: string[] }) {
+  return <div>{lines.map((line, i) => <p key={i}>{line}</p>)}</div>;
+});
+
 // ビルド識別子。**ビルドのたびに build.sh が書き換える。**
 // 「直したはずなのに反映されていない」を一目で判別するためにパネル上部へ出す。
 // 拡張のインストールはビルドを伴わず、入れ先も実行環境のホームなので、
@@ -201,6 +210,10 @@ interface PanelConfig {
   // **DOM 構築とスタイル再計算は飛ばさない**ので、見えないレイヤーにフレームの
   // 半分（83ms 中 43ms）を払っていた。normal / off は切り分け用に残してある。
   renderMode: "normal" | "visible-only" | "off" | "static";
+  // フレームごとに強制レイアウトを叩いて style + layout の時間を切り出すか。
+  // **既定は false。** 計測自体が1フレームあたり 2〜3ms を足すので、
+  // 内訳を見たいときだけ有効にする
+  measureLayout: boolean;
   maxHistoryDuration: number; // 履歴保持期間（秒）
   maxHistorySize: number; // 最大履歴サイズ
   namespaces: {
@@ -219,6 +232,7 @@ const defaultConfig: PanelConfig = {
   updateTopic: "/visualizer_svgs",
   enableUpdateTopic: true,
   renderMode: "visible-only",
+  measureLayout: false,
   // 差分は毎秒 40 件前後・1件 30KB 程度届く。履歴はシークの起点を確保するためだけの
   // ものなので短くてよい（スナップショットが 1Hz で来るため数秒あれば足りる）
   maxHistoryDuration: 30, // 30秒間
@@ -231,12 +245,13 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
 }) => {
   const [viewBox, setViewBox] = useState("-5000 -3000 10000 6000");
   const [config, setConfig] = useState<PanelConfig>(defaultConfig);
-  const [topics, setTopics] = useState<undefined | Immutable<Topic[]>>();
   const [messages, setMessages] = useState<
     undefined | Immutable<MessageEvent[]>
   >();
   const [renderDone, setRenderDone] = useState<(() => void) | undefined>();
-  const [recv_num, setRecvNum] = useState(0);
+  // 受信件数は表示するだけなので ref で持つ。
+  // state にすると毎フレーム setState が増え、その分コミットが1回増える
+  const recvNumRef = useRef(0);
   const [latest_msg, setLatestMsg] = useState<SvgLayerArray>();
   
   // 複数トピックのメッセージ履歴。**state ではなく ref で持つ。**
@@ -274,6 +289,13 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     visiblePrimitives: 0,        // うち表示中のレイヤーのもの
     domNodes: 0,                 // SVG 配下の実 DOM ノード数
   });
+  // 診断表示を作り直す合図。**毎フレームではなく1秒に1回。**
+  const [statsTick, setStatsTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setStatsTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+
   // namespaces の最新値。数え上げのために config を effect の依存に入れたくないので ref で持つ
   const namespacesRef = useRef<PanelConfig["namespaces"]>({});
   const PERF_SAMPLES = 30;
@@ -672,6 +694,12 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
                 ],
                 help: "遅さの切り分け用。変えても受信とログ記録には影響しない",
               },
+              measureLayout: {
+                label: "レイアウト時間を測る",
+                input: "boolean",
+                value: config.measureLayout,
+                help: "計測自体が 2〜3ms/frame を足す。内訳を見たいときだけ有効に",
+              },
               backgroundColor: { 
                 label: "背景色", 
                 input: "rgba", 
@@ -702,6 +730,8 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
                 setConfig((prevConfig) => ({ ...prevConfig, enableUpdateTopic: action.payload.value as boolean }));
               } else if (path == "display.renderMode") {
                 setConfig((prevConfig) => ({ ...prevConfig, renderMode: action.payload.value as PanelConfig["renderMode"] }));
+              } else if (path == "display.measureLayout") {
+                setConfig((prevConfig) => ({ ...prevConfig, measureLayout: action.payload.value as boolean }));
               } else if (path == "performance.maxHistoryDuration") {
                 setConfig((prevConfig) => ({ ...prevConfig, maxHistoryDuration: action.payload.value as number }));
               } else if (path == "performance.maxHistorySize") {
@@ -764,7 +794,6 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
 
       setRenderDone(() => done);
       setMessages(renderState.currentFrame);
-      setTopics(renderState.topics);
       
       // 現在時刻の更新を検出
       if (renderState.currentTime !== undefined) {
@@ -773,7 +802,6 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
       }
     };
 
-    context.watch("topics");
     context.watch("currentFrame");
     context.watch("currentTime");
 
@@ -831,7 +859,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     }
 
     lastAppliedTimeRef.current = newestTimestamp;
-    setRecvNum((prev) => prev + messages.length);
+    recvNumRef.current += messages.length;
 
     // 描画コストの内訳（診断用）。非表示レイヤーも DOM は作られるので、
     // 総数と表示中の数を分けて出す
@@ -885,6 +913,10 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   // getBoundingClientRect でスタイル再計算とレイアウトを同期的に走らせ、その分を
   // 切り出して測る。ブラウザ任せにすると paint と混ざって区別が付かない。
   useLayoutEffect(() => {
+    if (!config.measureLayout) {
+      perfRef.current.lastCommitMs = performance.now();
+      return;
+    }
     const t0 = performance.now();
     svgRef.current?.getBoundingClientRect();
     const t1 = performance.now();
@@ -930,31 +962,38 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     });
   }, [currentDisplayMsg]);
 
+  // 診断表示の中身。**依存は statsTick だけ。** 毎フレーム作り直すと
+  // PanelStats の memo が効かず、テキストの書き換えでレイアウトが毎フレーム汚れる
+  const statsLines = useMemo(() => {
+    const perf = perfRef.current;
+    const interval = average(perf.intervals);
+    const react = average(perf.durations);
+    const layout = config.measureLayout ? ` (layout ${average(perf.layouts).toFixed(1)})` : "";
+    const paint = Math.max(0, average(perf.frames) - react);
+    const wait = Math.max(0, interval - average(perf.frames));
+    return [
+      `Build: ${BUILD_TAG}`,
+      `Aggregated Topic: ${config.aggregatedTopic}`
+        + (config.enableUpdateTopic ? ` / Update Topic: ${config.updateTopic}` : ""),
+      `Receive num: ${recvNumRef.current}`,
+      `History: Aggregated(${aggregatedMessagesRef.current.size}),`
+        + ` Updates(${updateMessagesRef.current.size}),`
+        + ` Recompose failures: ${recomposeFailureRef.current}`,
+      `Panel: ${interval > 0 ? (1000 / interval).toFixed(1) : "-"} fps`
+        + ` / interval ${interval.toFixed(1)} ms`
+        + ` = react ${react.toFixed(1)}${layout}`
+        + ` + paint ${paint.toFixed(1)} + wait ${wait.toFixed(1)} ms`,
+      `primitives ${perf.visiblePrimitives} 表示 / ${perf.primitives} 総数`
+        + ` / DOM ${perf.domNodes} ノード`,
+      ...(seekTime !== undefined ? [`Seek Time: ${new Date(seekTime).toISOString()}`] : []),
+    ];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statsTick]);
+
   return (
     <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column" }}>
       <div style={{ width: "100%", height: "100%", overflow: "hidden" }}>
-        <div>
-          <p>Build: {BUILD_TAG}</p>
-          <p>Aggregated Topic: {config.aggregatedTopic}</p>
-          {config.enableUpdateTopic && <p>Update Topic: {config.updateTopic}</p>}
-        </div>
-        <div>
-          <p>Receive num: {recv_num}</p>
-          <p>History: Aggregated({aggregatedMessagesRef.current.size}), Updates({updateMessagesRef.current.size}), Recompose failures: {recomposeFailureRef.current}</p>
-          <p>
-            Panel: {(() => { const i = average(perfRef.current.intervals); return i > 0 ? (1000 / i).toFixed(1) : "-"; })()} fps
-            {" / interval "}{average(perfRef.current.intervals).toFixed(1)} ms
-            {" = react "}{average(perfRef.current.durations).toFixed(1)}
-            {" (layout "}{average(perfRef.current.layouts).toFixed(1)}{")"}
-            {" + paint "}{Math.max(0, average(perfRef.current.frames) - average(perfRef.current.durations)).toFixed(1)}
-            {" + wait "}{Math.max(0, average(perfRef.current.intervals) - average(perfRef.current.frames)).toFixed(1)} ms
-          </p>
-          <p>
-            primitives {perfRef.current.visiblePrimitives} 表示 / {perfRef.current.primitives} 総数
-            {" / DOM "}{perfRef.current.domNodes} ノード
-          </p>
-          {seekTime !== undefined && <p>Seek Time: {new Date(seekTime).toISOString()}</p>}
-        </div>
+        <PanelStats lines={statsLines} />
         <svg
           ref={svgRef}
           width="100%"
