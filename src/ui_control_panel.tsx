@@ -708,6 +708,46 @@ const ControlRow: React.FC<ControlProps> = ({
         );
       }
 
+      case "enum_services": {
+        // 見た目は enum_buttons と同じ。違うのは書き込みが parameter ではなく
+        // service で、選択肢ごとに呼ぶ先が違うところだけ
+        const table = readChoiceServices(control.payload);
+        const layout: React.CSSProperties =
+          control.columns > 0
+            ? {
+                display: "grid",
+                gap: 4,
+                gridTemplateColumns: `repeat(${control.columns}, minmax(0, 1fr))`,
+              }
+            : { display: "flex", flexWrap: "wrap", gap: 4 };
+        return (
+          <div style={layout}>
+            {control.choices.map((choice, index) => {
+              const target = table.get(choice);
+              const selected = current != undefined && current === choice;
+              return (
+                <button
+                  key={`${choice}-${index}`}
+                  // 対応する service が無い選択肢は押しても何も起きない。
+                  // 押せてしまうと「押したのに変わらない」と読めてしまう
+                  disabled={target == undefined || pending.has(target.service)}
+                  title={target == undefined ? choice : `${choice} → ${target.service}`}
+                  className={buttonClass(selected)}
+                  onClick={() => {
+                    if (target == undefined) {
+                      return;
+                    }
+                    onCallService(target.service, JSON.stringify(target.request ?? {}));
+                  }}
+                >
+                  {displayLabel(control, index)}
+                </button>
+              );
+            })}
+          </div>
+        );
+      }
+
       case "id_toggles": {
         // 現在値は parameter（int 配列）から読み、書き込みは service で行う。
         // parameter に直接書くとサーバー側の SimulatorSync を通らず、
@@ -904,6 +944,41 @@ function summarizeResponse(response: unknown): string {
     return "";
   }
   return text.length > 200 ? `${text.slice(0, 200)}…` : text;
+}
+
+/**
+ * {@code enum_services} の payload（選択肢名 → 呼ぶ service）を読む。
+ *
+ * <p>形は {@code {"<choice>": {"service": "/foo", "request": {...}}, ...}}。
+ * 選択肢ごとに呼ぶ service が違うので対応表が要る。添字合わせにすると
+ * 片方だけ並べ替えたときに黙ってずれるため、選択肢名をキーにしてある。
+ */
+function readChoiceServices(payload: string): Map<string, { service: string; request: unknown }> {
+  const table = new Map<string, { service: string; request: unknown }>();
+  if (payload.trim().length === 0) {
+    return table;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return table;
+  }
+  if (parsed == undefined || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return table;
+  }
+  for (const [choice, raw] of Object.entries(parsed as Record<string, unknown>)) {
+    if (raw == undefined || typeof raw !== "object") {
+      continue;
+    }
+    const entry = raw as Record<string, unknown>;
+    const service = entry["service"];
+    if (typeof service !== "string" || service.length === 0) {
+      continue;
+    }
+    table.set(choice, { service, request: entry["request"] ?? {} });
+  }
+  return table;
 }
 
 /** ステータス行に添える mm:ss */
