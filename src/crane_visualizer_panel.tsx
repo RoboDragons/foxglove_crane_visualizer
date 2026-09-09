@@ -96,6 +96,23 @@ const normalizeUpdates = (raw: any): SvgUpdateArray | undefined => {
   }
 };
 
+// 組み直しの結果でレイヤー状態を置き換える。
+//
+// **結果が空なら置き換えない。** 履歴にスナップショットが無い時刻を組み直すと
+// undefined や空が返るが、それで置き換えると画面から絵が全部消える。
+// 古い絵を出したまま次のスナップショット（1秒以内）を待つほうが実害が小さい。
+//
+// @returns 置き換えたら true
+const replaceLayersIfNotEmpty = (
+  target: React.MutableRefObject<Map<string, SvgPrimitiveArray>>,
+  composed: SvgLayerArray | undefined
+): boolean => {
+  const arrays = composed?.svg_primitive_arrays;
+  if (!arrays || arrays.length === 0) return false;
+  target.current = new Map(arrays.map((array) => [array.layer, array]));
+  return true;
+};
+
 // シークとみなす巻き戻り量[ms]。
 // ライブ受信でも currentTime と receiveTime は数 ms ずれるので、
 // その揺れをシークと誤判定しないだけの余裕を持たせる。
@@ -201,6 +218,8 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   const liveLayersRef = useRef<Map<string, SvgPrimitiveArray>>(new Map());
   // 最後に適用したメッセージの時刻（receiveTime）
   const lastAppliedTimeRef = useRef<number>(-1);
+  // 組み直しに失敗した回数（診断用）。増え続けるならシーク判定が誤発火している
+  const recomposeFailureRef = useRef<number>(0);
   // 最後に見た再生時刻（currentTime）。シークの検出に使う。
   // **メッセージ側の時刻（receiveTime）と比べないこと。**
   // 別々の時計なのでライブ受信でも数 ms ずれ、毎フレーム「シーク」と誤判定して
@@ -379,7 +398,17 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     // 基準はメッセージ側の時刻（receiveTime）であって実時間ではない。
     // Date.now() を使うと、MCAP の再生中は記録時刻が過去にあるため
     // 履歴が毎回まるごと捨てられ、スナップショットが来るまで絵が欠ける。
-    const latestTimestamp = lastAppliedTimeRef.current;
+    //
+    // **基準は履歴そのものから取る。** lastAppliedTimeRef を使うと、
+    // シーク後にそこへ再生時刻（別の時計）が入っていた場合に
+    // 履歴をまるごと捨ててしまい、次の組み直しが空になって絵が全部消える。
+    let latestTimestamp = -1;
+    for (const [timestamp] of aggregatedMessagesRef.current) {
+      if (timestamp > latestTimestamp) latestTimestamp = timestamp;
+    }
+    for (const [timestamp] of updateMessagesRef.current) {
+      if (timestamp > latestTimestamp) latestTimestamp = timestamp;
+    }
     if (latestTimestamp < 0) return;  // まだ何も受け取っていない
     const cutoffTime = latestTimestamp - (config.maxHistoryDuration * 1000);
 
@@ -686,11 +715,11 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     }
 
     if (rewound) {
-      // シークで時刻が巻き戻った。差分の積み上げは当てにならないので履歴から組み直す
-      const composed = composeMessagesAtTime(newestTimestamp);
-      liveLayersRef.current = new Map(
-        (composed?.svg_primitive_arrays ?? []).map((array) => [array.layer, array])
-      );
+      // シークで時刻が巻き戻った。差分の積み上げは当てにならないので履歴から組み直す。
+      // 組み直せなかったら今の絵を残したまま次のスナップショットを待つ
+      if (!replaceLayersIfNotEmpty(liveLayersRef, composeMessagesAtTime(newestTimestamp))) {
+        recomposeFailureRef.current += 1;
+      }
     } else {
       for (const message of messages) {
         if (message.topic === config.aggregatedTopic) {
@@ -728,11 +757,16 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     if (seekTime >= previousSeekTime - SEEK_BACKWARD_THRESHOLD_MS) return;
 
     const composed = composeMessagesAtTime(seekTime);
-    liveLayersRef.current = new Map(
-      (composed?.svg_primitive_arrays ?? []).map((array) => [array.layer, array])
-    );
-    lastAppliedTimeRef.current = seekTime;
-    setCurrentDisplayMsg(composed);
+    if (!replaceLayersIfNotEmpty(liveLayersRef, composed)) {
+      recomposeFailureRef.current += 1;
+      return;  // 組み直せなかった。今の絵を残す
+    }
+    // **ここに seekTime（再生時刻）を入れないこと。**
+    // lastAppliedTimeRef はメッセージ側の時計（receiveTime）で統一する。
+    // -1 は「シーク後まだ何も適用していない」の意味で、次に届いたメッセージが
+    // 巻き戻し扱いされずにこの組み直し結果へ積み上がる
+    lastAppliedTimeRef.current = -1;
+    setCurrentDisplayMsg({ svg_primitive_arrays: Array.from(liveLayersRef.current.values()) });
   }, [seekTime, composeMessagesAtTime]);
 
   useEffect(() => {
@@ -769,7 +803,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
         </div>
         <div>
           <p>Receive num: {recv_num}</p>
-          <p>History: Aggregated({aggregatedMessagesRef.current.size}), Updates({updateMessagesRef.current.size})</p>
+          <p>History: Aggregated({aggregatedMessagesRef.current.size}), Updates({updateMessagesRef.current.size}), Recompose failures: {recomposeFailureRef.current}</p>
           {seekTime !== undefined && <p>Seek Time: {new Date(seekTime).toISOString()}</p>}
         </div>
         <svg
