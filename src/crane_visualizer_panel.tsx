@@ -124,11 +124,10 @@ const joinedHtml = (primitives: string[]): string => {
   return html;
 };
 
-// 診断表示。**毎フレーム更新しないこと。**
+// パネル上部の表示。**毎フレーム更新しないこと。**
 //
-// 表示するのは数字だけだが、テキストを毎フレーム書き換えると SVG と同じ
-// レイアウトツリーが毎フレーム汚れる。実測では SVG を空（DOM 0 ノード）にしても
-// react が 4.1ms 残っており、その大半がこの表示自身だった。
+// テキストを毎フレーム書き換えると SVG と同じレイアウトツリーが毎フレーム汚れる。
+// 実測では SVG を空（DOM 0 ノード）にしても、この表示だけで 4ms/frame を食っていた。
 // props を1秒に1回しか変えないことで、それ以外のフレームは React ごと素通しする。
 const PanelStats = memo(function PanelStats({ lines }: { lines: string[] }) {
   return <div>{lines.map((line, i) => <p key={i}>{line}</p>)}</div>;
@@ -195,25 +194,6 @@ interface PanelConfig {
   aggregatedTopic: string; // /aggregated_svgsトピック名
   updateTopic: string; // /visualizer_svgsトピック名
   enableUpdateTopic: boolean; // /visualizer_svgsトピックの有効/無効
-  // 描画モード（遅さの切り分け用）。**既定は normal で従来どおり。**
-  // どのモードでも受信・履歴・MCAP への記録には影響しない
-  // （MCAP はサーバー側の Sink が書くので、ここで何を描くかとログの中身は無関係）。
-  //   normal       : 全レイヤーを描く（非表示レイヤーは display:none）
-  //   visible-only : 表示中のレイヤーだけ要素を作る（**既定**）
-  //   off          : 何も描かない
-  //   static       : 全レイヤーを1度だけ描き、以後 DOM を更新しない（切り分け用）
-  //
-  // static は「要素数が重いのか、毎フレーム作り直しているのが重いのか」を分ける。
-  // 全 484 要素を出したまま 60fps 近く出るなら、コストは作り直し側にある。
-  //
-  // 既定が visible-only なのは実測から。display:none はレイアウトと描画は飛ばすが、
-  // **DOM 構築とスタイル再計算は飛ばさない**ので、見えないレイヤーにフレームの
-  // 半分（83ms 中 43ms）を払っていた。normal / off は切り分け用に残してある。
-  renderMode: "normal" | "visible-only" | "off" | "static";
-  // フレームごとに強制レイアウトを叩いて style + layout の時間を切り出すか。
-  // **既定は false。** 計測自体が1フレームあたり 2〜3ms を足すので、
-  // 内訳を見たいときだけ有効にする
-  measureLayout: boolean;
   maxHistoryDuration: number; // 履歴保持期間（秒）
   maxHistorySize: number; // 最大履歴サイズ
   namespaces: {
@@ -231,8 +211,6 @@ const defaultConfig: PanelConfig = {
   aggregatedTopic: "/aggregated_svgs",
   updateTopic: "/visualizer_svgs",
   enableUpdateTopic: true,
-  renderMode: "visible-only",
-  measureLayout: false,
   // 差分は毎秒 40 件前後・1件 30KB 程度届く。履歴はシークの起点を確保するためだけの
   // ものなので短くてよい（スナップショットが 1Hz で来るため数秒あれば足りる）
   maxHistoryDuration: 30, // 30秒間
@@ -267,28 +245,6 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   const liveLayersRef = useRef<Map<string, SvgPrimitiveArray>>(new Map());
   // 最後に適用したメッセージの時刻（receiveTime）
   const lastAppliedTimeRef = useRef<number>(-1);
-  // 組み直しに失敗した回数（診断用）。増え続けるならシーク判定が誤発火している
-  const recomposeFailureRef = useRef<number>(0);
-  // static モードで固定したレイヤー（切り分け用）
-  const frozenArraysRef = useRef<SvgPrimitiveArray[] | undefined>(undefined);
-
-  // 描画性能の計測（診断用）。
-  // 「トピックは 50〜60Hz 来ているのに画面がもっさり」を切り分けるためのもの。
-  // onRender の間隔＝Studio がこのパネルを描き直せている実効レート、
-  // onRender から done() までが React の再構築にかかっている時間。
-  // done() を返すまで Studio は次のフレームを渡さないので、後者が長いほど前者が落ちる。
-  const perfRef = useRef({
-    frameStartMs: 0,
-    lastCommitMs: 0,             // このフレームで最後にコミットが終わった時刻
-    layoutSumMs: 0,              // このフレームで強制レイアウトに費やした合計[ms]
-    intervals: [] as number[],   // onRender の間隔[ms]
-    durations: [] as number[],   // onRender → 最後のコミット完了[ms]
-    layouts: [] as number[],     // うちスタイル再計算＋レイアウト[ms]
-    frames: [] as number[],      // onRender → 次のアニメーションフレーム[ms]（＝ブラウザの描画込み）
-    primitives: 0,               // 直近フレームのプリミティブ総数
-    visiblePrimitives: 0,        // うち表示中のレイヤーのもの
-    domNodes: 0,                 // SVG 配下の実 DOM ノード数
-  });
   // 診断表示を作り直す合図。**毎フレームではなく1秒に1回。**
   const [statsTick, setStatsTick] = useState(0);
   useEffect(() => {
@@ -296,15 +252,6 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     return () => clearInterval(id);
   }, []);
 
-  // namespaces の最新値。数え上げのために config を effect の依存に入れたくないので ref で持つ
-  const namespacesRef = useRef<PanelConfig["namespaces"]>({});
-  const PERF_SAMPLES = 30;
-  const pushSample = (samples: number[], value: number) => {
-    samples.push(value);
-    if (samples.length > PERF_SAMPLES) samples.shift();
-  };
-  const average = (samples: number[]) =>
-    samples.length === 0 ? 0 : samples.reduce((a, b) => a + b, 0) / samples.length;
   // 最後に見た再生時刻（currentTime）。シークの検出に使う。
   // **メッセージ側の時刻（receiveTime）と比べないこと。**
   // 別々の時計なのでライブ受信でも数 ms ずれ、毎フレーム「シーク」と誤判定して
@@ -616,15 +563,6 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   }, [config.aggregatedTopic, config.updateTopic, config.enableUpdateTopic, context]);
 
   useLayoutEffect(() => {
-    namespacesRef.current = config.namespaces;
-  }, [config.namespaces]);
-
-  // モードを切り替えたら固定を解除する（次に static にしたとき最新で固定し直す）
-  useEffect(() => {
-    if (config.renderMode !== "static") frozenArraysRef.current = undefined;
-  }, [config.renderMode]);
-
-  useLayoutEffect(() => {
     context.saveState(config);
   }, [config, context]);
 
@@ -682,24 +620,6 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
           display: {
             label: "表示設定",
             fields: {
-              renderMode: {
-                label: "描画モード",
-                input: "select",
-                value: config.renderMode,
-                options: [
-                  { label: "通常", value: "normal" },
-                  { label: "表示中のみ要素を作る", value: "visible-only" },
-                  { label: "描画しない（計測用）", value: "off" },
-                  { label: "静止・全レイヤー（計測用）", value: "static" },
-                ],
-                help: "遅さの切り分け用。変えても受信とログ記録には影響しない",
-              },
-              measureLayout: {
-                label: "レイアウト時間を測る",
-                input: "boolean",
-                value: config.measureLayout,
-                help: "計測自体が 2〜3ms/frame を足す。内訳を見たいときだけ有効に",
-              },
               backgroundColor: { 
                 label: "背景色", 
                 input: "rgba", 
@@ -728,10 +648,6 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
                 setConfig((prevConfig) => ({ ...prevConfig, updateTopic: action.payload.value as string }));
               } else if (path == "topics.enableUpdateTopic") {
                 setConfig((prevConfig) => ({ ...prevConfig, enableUpdateTopic: action.payload.value as boolean }));
-              } else if (path == "display.renderMode") {
-                setConfig((prevConfig) => ({ ...prevConfig, renderMode: action.payload.value as PanelConfig["renderMode"] }));
-              } else if (path == "display.measureLayout") {
-                setConfig((prevConfig) => ({ ...prevConfig, measureLayout: action.payload.value as boolean }));
               } else if (path == "performance.maxHistoryDuration") {
                 setConfig((prevConfig) => ({ ...prevConfig, maxHistoryDuration: action.payload.value as number }));
               } else if (path == "performance.maxHistorySize") {
@@ -786,12 +702,6 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
 
   useLayoutEffect(() => {
     context.onRender = (renderState, done) => {
-      const nowMs = performance.now();
-      if (perfRef.current.frameStartMs > 0) {
-        pushSample(perfRef.current.intervals, nowMs - perfRef.current.frameStartMs);
-      }
-      perfRef.current.frameStartMs = nowMs;
-
       setRenderDone(() => done);
       setMessages(renderState.currentFrame);
       
@@ -837,9 +747,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     if (rewound) {
       // シークで時刻が巻き戻った。差分の積み上げは当てにならないので履歴から組み直す。
       // 組み直せなかったら今の絵を残したまま次のスナップショットを待つ
-      if (!replaceLayersIfNotEmpty(liveLayersRef, composeMessagesAtTime(newestTimestamp))) {
-        recomposeFailureRef.current += 1;
-      }
+      replaceLayersIfNotEmpty(liveLayersRef, composeMessagesAtTime(newestTimestamp));
     } else {
       for (const message of messages) {
         if (message.topic === config.aggregatedTopic) {
@@ -861,19 +769,6 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     lastAppliedTimeRef.current = newestTimestamp;
     recvNumRef.current += messages.length;
 
-    // 描画コストの内訳（診断用）。非表示レイヤーも DOM は作られるので、
-    // 総数と表示中の数を分けて出す
-    let primitives = 0;
-    let visiblePrimitives = 0;
-    for (const array of liveLayersRef.current.values()) {
-      primitives += array.svg_primitives.length;
-      if (namespacesRef.current[array.layer]?.visible) {
-        visiblePrimitives += array.svg_primitives.length;
-      }
-    }
-    perfRef.current.primitives = primitives;
-    perfRef.current.visiblePrimitives = visiblePrimitives;
-
     setCurrentDisplayMsg({ svg_primitive_arrays: Array.from(liveLayersRef.current.values()) });
   }, [messages, config.aggregatedTopic, config.updateTopic, config.enableUpdateTopic,
       composeMessagesAtTime]);
@@ -892,7 +787,6 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
 
     const composed = composeMessagesAtTime(seekTime);
     if (!replaceLayersIfNotEmpty(liveLayersRef, composed)) {
-      recomposeFailureRef.current += 1;
       return;  // 組み直せなかった。今の絵を残す
     }
     // **ここに seekTime（再生時刻）を入れないこと。**
@@ -903,41 +797,8 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     setCurrentDisplayMsg({ svg_primitive_arrays: Array.from(liveLayersRef.current.values()) });
   }, [seekTime, composeMessagesAtTime]);
 
-  // 毎コミット後に走る（依存配列なし）。
-  //
-  // **1フレームに1回ではない。** onRender は setState を4回続けて呼び、
-  // React 17 の legacy モードでは React 外からの setState はバッチされないので、
-  // 1フレームで4〜5回コミットが起きる。最初のコミットだけを測ると
-  // 本命の DOM 更新が paint 側に紛れ込むため、最後のコミット時刻を持ち回る。
-  //
-  // getBoundingClientRect でスタイル再計算とレイアウトを同期的に走らせ、その分を
-  // 切り出して測る。ブラウザ任せにすると paint と混ざって区別が付かない。
-  useLayoutEffect(() => {
-    if (!config.measureLayout) {
-      perfRef.current.lastCommitMs = performance.now();
-      return;
-    }
-    const t0 = performance.now();
-    svgRef.current?.getBoundingClientRect();
-    const t1 = performance.now();
-    perfRef.current.lastCommitMs = t1;
-    perfRef.current.layoutSumMs += t1 - t0;
-  });
-
+  // done() を返すまで Studio は次のフレームを渡さない
   useEffect(() => {
-    if (renderDone && perfRef.current.frameStartMs > 0) {
-      perfRef.current.domNodes = svgRef.current?.getElementsByTagName("*").length ?? 0;
-
-      // 次のアニメーションフレームまで＝ブラウザがこのフレームを
-      // 描画し終えて戻ってくるまで。この時点でこのフレームのコミットは全部済んでいる
-      const startMs = perfRef.current.frameStartMs;
-      requestAnimationFrame(() => {
-        pushSample(perfRef.current.frames, performance.now() - startMs);
-        pushSample(perfRef.current.durations, perfRef.current.lastCommitMs - startMs);
-        pushSample(perfRef.current.layouts, perfRef.current.layoutSumMs);
-        perfRef.current.layoutSumMs = 0;
-      });
-    }
     renderDone?.();
   }, [renderDone]);
 
@@ -962,33 +823,16 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     });
   }, [currentDisplayMsg]);
 
-  // 診断表示の中身。**依存は statsTick だけ。** 毎フレーム作り直すと
-  // PanelStats の memo が効かず、テキストの書き換えでレイアウトが毎フレーム汚れる
-  const statsLines = useMemo(() => {
-    const perf = perfRef.current;
-    const interval = average(perf.intervals);
-    const react = average(perf.durations);
-    const layout = config.measureLayout ? ` (layout ${average(perf.layouts).toFixed(1)})` : "";
-    const paint = Math.max(0, average(perf.frames) - react);
-    const wait = Math.max(0, interval - average(perf.frames));
-    return [
-      `Build: ${BUILD_TAG}`,
-      `Aggregated Topic: ${config.aggregatedTopic}`
-        + (config.enableUpdateTopic ? ` / Update Topic: ${config.updateTopic}` : ""),
-      `Receive num: ${recvNumRef.current}`,
-      `History: Aggregated(${aggregatedMessagesRef.current.size}),`
-        + ` Updates(${updateMessagesRef.current.size}),`
-        + ` Recompose failures: ${recomposeFailureRef.current}`,
-      `Panel: ${interval > 0 ? (1000 / interval).toFixed(1) : "-"} fps`
-        + ` / interval ${interval.toFixed(1)} ms`
-        + ` = react ${react.toFixed(1)}${layout}`
-        + ` + paint ${paint.toFixed(1)} + wait ${wait.toFixed(1)} ms`,
-      `primitives ${perf.visiblePrimitives} 表示 / ${perf.primitives} 総数`
-        + ` / DOM ${perf.domNodes} ノード`,
-      ...(seekTime !== undefined ? [`Seek Time: ${new Date(seekTime).toISOString()}`] : []),
-    ];
+  // 上部表示の中身。**依存は statsTick だけ。** 毎フレーム作り直すと
+  // PanelStats の memo が効かず、テキストの書き換えでレイアウトが毎フレーム汚れる。
+  //
+  // Build は「直したはずなのに反映されていない」を潰すために出している。
+  // 受信件数は絵が止まったときに「届いていないのか描けていないのか」を分けるため。
+  const statsLines = useMemo(() => [
+    `Build: ${BUILD_TAG}`,
+    `Receive num: ${recvNumRef.current}`,
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [statsTick]);
+  ], [statsTick]);
 
   return (
     <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column" }}>
@@ -1072,22 +916,12 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
               ? (currentDisplayMsg ?? latest_msg)
               : latest_msg;
 
-            // 描画モードは遅さの切り分け用。既定（normal）は従来どおり全レイヤーを描く
-            if (config.renderMode === "off") return null;
-
-            let arrays: SvgPrimitiveArray[] | undefined;
-            if (config.renderMode === "static") {
-              // 最初に届いた全レイヤーで固定する。以後 DOM は一切更新されない
-              if (!frozenArraysRef.current && displayMsg) {
-                frozenArraysRef.current = displayMsg.svg_primitive_arrays;
-              }
-              arrays = frozenArraysRef.current;
-            } else if (config.renderMode === "visible-only") {
-              arrays = displayMsg?.svg_primitive_arrays.filter(
-                (array) => config.namespaces[array.layer]?.visible);
-            } else {
-              arrays = displayMsg?.svg_primitive_arrays;
-            }
+            // **表示中のレイヤーだけ要素を作る。**
+            // display:none で隠す方式はレイアウトと描画こそ飛ばすが、
+            // DOM 構築とスタイル再計算は飛ばさない。実測では、画面に出ていない
+            // 400 プリミティブにフレームの半分（83ms 中 43ms）を払っていた。
+            const arrays = displayMsg?.svg_primitive_arrays.filter(
+              (array) => config.namespaces[array.layer]?.visible);
 
             // **プリミティブ1つずつではなく、レイヤーごとに1回だけ innerHTML を張る。**
             // 1つずつだと要素数だけ HTML パースとラッパー <g> が増える
@@ -1096,9 +930,6 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
             return arrays?.map((svg_primitive_array) => (
               <g
                 key={svg_primitive_array.layer}
-                style={config.renderMode === "normal"
-                  ? { display: config.namespaces[svg_primitive_array.layer]?.visible ? 'block' : 'none' }
-                  : undefined}
                 dangerouslySetInnerHTML={{ __html: joinedHtml(svg_primitive_array.svg_primitives) }}
               />
             ));
