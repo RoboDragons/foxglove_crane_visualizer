@@ -220,6 +220,28 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   const lastAppliedTimeRef = useRef<number>(-1);
   // 組み直しに失敗した回数（診断用）。増え続けるならシーク判定が誤発火している
   const recomposeFailureRef = useRef<number>(0);
+
+  // 描画性能の計測（診断用）。
+  // 「トピックは 50〜60Hz 来ているのに画面がもっさり」を切り分けるためのもの。
+  // onRender の間隔＝Studio がこのパネルを描き直せている実効レート、
+  // onRender から done() までが React の再構築にかかっている時間。
+  // done() を返すまで Studio は次のフレームを渡さないので、後者が長いほど前者が落ちる。
+  const perfRef = useRef({
+    frameStartMs: 0,
+    intervals: [] as number[],   // onRender の間隔[ms]
+    durations: [] as number[],   // onRender → done() の所要[ms]
+    primitives: 0,               // 直近フレームのプリミティブ総数
+    visiblePrimitives: 0,        // うち表示中のレイヤーのもの
+  });
+  // namespaces の最新値。数え上げのために config を effect の依存に入れたくないので ref で持つ
+  const namespacesRef = useRef<PanelConfig["namespaces"]>({});
+  const PERF_SAMPLES = 30;
+  const pushSample = (samples: number[], value: number) => {
+    samples.push(value);
+    if (samples.length > PERF_SAMPLES) samples.shift();
+  };
+  const average = (samples: number[]) =>
+    samples.length === 0 ? 0 : samples.reduce((a, b) => a + b, 0) / samples.length;
   // 最後に見た再生時刻（currentTime）。シークの検出に使う。
   // **メッセージ側の時刻（receiveTime）と比べないこと。**
   // 別々の時計なのでライブ受信でも数 ms ずれ、毎フレーム「シーク」と誤判定して
@@ -531,6 +553,10 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   }, [config.aggregatedTopic, config.updateTopic, config.enableUpdateTopic, context]);
 
   useLayoutEffect(() => {
+    namespacesRef.current = config.namespaces;
+  }, [config.namespaces]);
+
+  useLayoutEffect(() => {
     context.saveState(config);
   }, [config, context]);
 
@@ -670,6 +696,12 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
 
   useLayoutEffect(() => {
     context.onRender = (renderState, done) => {
+      const nowMs = performance.now();
+      if (perfRef.current.frameStartMs > 0) {
+        pushSample(perfRef.current.intervals, nowMs - perfRef.current.frameStartMs);
+      }
+      perfRef.current.frameStartMs = nowMs;
+
       setRenderDone(() => done);
       setMessages(renderState.currentFrame);
       setTopics(renderState.topics);
@@ -740,6 +772,20 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
 
     lastAppliedTimeRef.current = newestTimestamp;
     setRecvNum((prev) => prev + messages.length);
+
+    // 描画コストの内訳（診断用）。非表示レイヤーも DOM は作られるので、
+    // 総数と表示中の数を分けて出す
+    let primitives = 0;
+    let visiblePrimitives = 0;
+    for (const array of liveLayersRef.current.values()) {
+      primitives += array.svg_primitives.length;
+      if (namespacesRef.current[array.layer]?.visible) {
+        visiblePrimitives += array.svg_primitives.length;
+      }
+    }
+    perfRef.current.primitives = primitives;
+    perfRef.current.visiblePrimitives = visiblePrimitives;
+
     setCurrentDisplayMsg({ svg_primitive_arrays: Array.from(liveLayersRef.current.values()) });
   }, [messages, config.aggregatedTopic, config.updateTopic, config.enableUpdateTopic,
       composeMessagesAtTime]);
@@ -770,6 +816,9 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   }, [seekTime, composeMessagesAtTime]);
 
   useEffect(() => {
+    if (renderDone && perfRef.current.frameStartMs > 0) {
+      pushSample(perfRef.current.durations, performance.now() - perfRef.current.frameStartMs);
+    }
     renderDone?.();
   }, [renderDone]);
 
@@ -804,6 +853,11 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
         <div>
           <p>Receive num: {recv_num}</p>
           <p>History: Aggregated({aggregatedMessagesRef.current.size}), Updates({updateMessagesRef.current.size}), Recompose failures: {recomposeFailureRef.current}</p>
+          <p>
+            Panel: {(() => { const i = average(perfRef.current.intervals); return i > 0 ? (1000 / i).toFixed(1) : "-"; })()} fps
+            {" / render "}{average(perfRef.current.durations).toFixed(1)} ms
+            {" / primitives "}{perfRef.current.visiblePrimitives} 表示 / {perfRef.current.primitives} 総数
+          </p>
           {seekTime !== undefined && <p>Seek Time: {new Date(seekTime).toISOString()}</p>}
         </div>
         <svg
