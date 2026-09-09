@@ -113,11 +113,23 @@ const replaceLayersIfNotEmpty = (
   return true;
 };
 
+// レイヤーのプリミティブを連結した HTML のキャッシュ。
+// 配列の参照が同じなら連結結果も同じなので、変化していないレイヤーで
+// 文字列を作り直さない（React も同じ文字列なら DOM に触らない）。
+const joinedHtmlCache = new WeakMap<readonly string[], string>();
+const joinedHtml = (primitives: string[]): string => {
+  const cached = joinedHtmlCache.get(primitives);
+  if (cached !== undefined) return cached;
+  const html = primitives.join("");
+  joinedHtmlCache.set(primitives, html);
+  return html;
+};
+
 // ビルド識別子。**ビルドのたびに build.sh が書き換える。**
 // 「直したはずなのに反映されていない」を一目で判別するためにパネル上部へ出す。
 // 拡張のインストールはビルドを伴わず、入れ先も実行環境のホームなので、
 // 古いビルドが黙って読まれることが実際に何度も起きた。
-const BUILD_TAG = "93f91fd-0909-1504";
+const BUILD_TAG = "85f5509-0909-1510";
 
 // シークとみなす巻き戻り量[ms]。
 // ライブ受信でも currentTime と receiveTime は数 ms ずれるので、
@@ -178,8 +190,12 @@ interface PanelConfig {
   // どのモードでも受信・履歴・MCAP への記録には影響しない
   // （MCAP はサーバー側の Sink が書くので、ここで何を描くかとログの中身は無関係）。
   //   normal       : 全レイヤーを描く（非表示レイヤーは display:none）
-  //   visible-only : 表示中のレイヤーだけ要素を作る
+  //   visible-only : 表示中のレイヤーだけ要素を作る（**既定**）
   //   off          : 何も描かない
+  //
+  // 既定が visible-only なのは実測から。display:none はレイアウトと描画は飛ばすが、
+  // **DOM 構築とスタイル再計算は飛ばさない**ので、見えないレイヤーにフレームの
+  // 半分（83ms 中 43ms）を払っていた。normal / off は切り分け用に残してある。
   renderMode: "normal" | "visible-only" | "off";
   maxHistoryDuration: number; // 履歴保持期間（秒）
   maxHistorySize: number; // 最大履歴サイズ
@@ -198,7 +214,7 @@ const defaultConfig: PanelConfig = {
   aggregatedTopic: "/aggregated_svgs",
   updateTopic: "/visualizer_svgs",
   enableUpdateTopic: true,
-  renderMode: "normal",
+  renderMode: "visible-only",
   // 差分は毎秒 40 件前後・1件 30KB 程度届く。履歴はシークの起点を確保するためだけの
   // ものなので短くてよい（スナップショットが 1Hz で来るため数秒あれば足りる）
   maxHistoryDuration: 30, // 30秒間
@@ -991,12 +1007,18 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
                   (array) => config.namespaces[array.layer]?.visible)
               : displayMsg?.svg_primitive_arrays;
 
+            // **プリミティブ1つずつではなく、レイヤーごとに1回だけ innerHTML を張る。**
+            // 1つずつだと要素数だけ HTML パースとラッパー <g> が増える
+            // （485 プリミティブなら 485 回のパースと 485 個の余分なノード）。
+            // レイヤー単位なら 30 回で済み、ラッパーも要らない。
             return arrays?.map((svg_primitive_array) => (
-              <g key={svg_primitive_array.layer} style={{ display: config.namespaces[svg_primitive_array.layer]?.visible ? 'block' : 'none' }}>
-                {svg_primitive_array.svg_primitives.map((svg_primitive, svgIndex) => (
-                  <g key={svgIndex} dangerouslySetInnerHTML={{ __html: svg_primitive }} />
-                ))}
-              </g>
+              <g
+                key={svg_primitive_array.layer}
+                style={config.renderMode === "normal"
+                  ? { display: config.namespaces[svg_primitive_array.layer]?.visible ? 'block' : 'none' }
+                  : undefined}
+                dangerouslySetInnerHTML={{ __html: joinedHtml(svg_primitive_array.svg_primitives) }}
+              />
             ));
           })()}
         </svg>
