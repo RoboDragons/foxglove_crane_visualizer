@@ -11,9 +11,7 @@ NODE=node
 CLI=node_modules/create-foxglove-extension/dist/bin/foxglove-extension.js
 EXT=ibisssl.foxglove-crane-visualizer-0.0.17
 
-# ビルド識別子を埋め込む。パネル上部に出るので、読まれている版が一目で分かる
 TAG="$(git rev-parse --short HEAD)-$(date +%m%d-%H%M)"
-sed -i "s/^const BUILD_TAG = \".*\";/const BUILD_TAG = \"${TAG}\";/" src/crane_visualizer_panel.tsx
 
 $NODE node_modules/typescript/bin/tsc --noEmit
 # **本番ビルドを明示すること。** 既定は development で、React の開発ビルド
@@ -30,5 +28,5 @@ for WIN in /mnt/c/Users/*/.foxglove-studio/extensions/"$EXT"; do
   echo "配布: $WIN"
 done
 
-echo "ビルド識別子: ${TAG}"
-echo "Studio を再起動し、パネル上部の Build がこの値になっていることを確認すること"
+echo "ビルド: ${TAG}"
+echo "Studio を再起動してから確認すること"

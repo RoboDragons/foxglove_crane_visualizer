@@ -133,12 +133,6 @@ const PanelStats = memo(function PanelStats({ lines }: { lines: string[] }) {
   return <div>{lines.map((line, i) => <p key={i}>{line}</p>)}</div>;
 });
 
-// ビルド識別子。**ビルドのたびに build.sh が書き換える。**
-// 「直したはずなのに反映されていない」を一目で判別するためにパネル上部へ出す。
-// 拡張のインストールはビルドを伴わず、入れ先も実行環境のホームなので、
-// 古いビルドが黙って読まれることが実際に何度も起きた。
-const BUILD_TAG = "7597301-0909-1545";
-
 // シークとみなす巻き戻り量[ms]。
 // ライブ受信でも currentTime と receiveTime は数 ms ずれるので、
 // その揺れをシークと誤判定しないだけの余裕を持たせる。
@@ -245,7 +239,14 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   const liveLayersRef = useRef<Map<string, SvgPrimitiveArray>>(new Map());
   // 最後に適用したメッセージの時刻（receiveTime）
   const lastAppliedTimeRef = useRef<number>(-1);
-  // 診断表示を作り直す合図。**毎フレームではなく1秒に1回。**
+  // 描画レートの計測。**`onRender` の間隔だけ**を見る。
+  // これは「Studio がこのパネルを描き直せている実効レート」で、
+  // 絵が重いのか届いていないのかを分けるのに要る。
+  // 直近 30 フレームの移動平均。ここに他の計測を足さないこと
+  // （強制レイアウトや DOM の数え上げは、それ自体が 2〜4ms/frame を食う）
+  const rateRef = useRef({ lastMs: 0, intervals: [] as number[] });
+
+  // 上部表示を作り直す合図。**毎フレームではなく1秒に1回。**
   const [statsTick, setStatsTick] = useState(0);
   useEffect(() => {
     const id = setInterval(() => setStatsTick((t) => t + 1), 1000);
@@ -702,6 +703,14 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
 
   useLayoutEffect(() => {
     context.onRender = (renderState, done) => {
+      const nowMs = performance.now();
+      const rate = rateRef.current;
+      if (rate.lastMs > 0) {
+        rate.intervals.push(nowMs - rate.lastMs);
+        if (rate.intervals.length > 30) rate.intervals.shift();
+      }
+      rate.lastMs = nowMs;
+
       setRenderDone(() => done);
       setMessages(renderState.currentFrame);
       
@@ -826,13 +835,17 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   // 上部表示の中身。**依存は statsTick だけ。** 毎フレーム作り直すと
   // PanelStats の memo が効かず、テキストの書き換えでレイアウトが毎フレーム汚れる。
   //
-  // Build は「直したはずなのに反映されていない」を潰すために出している。
-  // 受信件数は絵が止まったときに「届いていないのか描けていないのか」を分けるため。
-  const statsLines = useMemo(() => [
-    `Build: ${BUILD_TAG}`,
-    `Receive num: ${recvNumRef.current}`,
+  // 受信件数と描画レートを並べる。絵が止まったときに
+  // 「届いていないのか、描けていないのか」をこの2つで分ける。
+  const statsLines = useMemo(() => {
+    const intervals = rateRef.current.intervals;
+    const interval = intervals.length === 0
+      ? 0
+      : intervals.reduce((a, b) => a + b, 0) / intervals.length;
+    const fps = interval > 0 ? (1000 / interval).toFixed(1) : "-";
+    return [`Receive num: ${recvNumRef.current} / ${fps} fps`];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  ], [statsTick]);
+  }, [statsTick]);
 
   return (
     <div style={{ width: "100%", height: "100%", display: "flex", flexDirection: "column" }}>
