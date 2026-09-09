@@ -15,6 +15,7 @@ import {
   useEffect,
   useLayoutEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import ReactDOM from "react-dom";
@@ -23,6 +24,13 @@ const DEFAULT_TOPIC = "/ui_layout";
 const UNGROUPED_LABEL = "General";
 // int_range をドロップダウンで出す上限。これを超えたら数値入力にフォールバックする
 const MAX_RANGE_OPTIONS = 500;
+// confirm 付きボタンを構えたままにする時間[ms]。過ぎたら元のラベルに戻す。
+// 短すぎると読む前に戻り、長すぎると次の操作のつもりの1クリックで実行してしまう
+const CONFIRM_TIMEOUT_MS = 4000;
+// 成功と呼び出し中の行を残す時間[ms]。エラーは消さない
+const STATUS_FADE_MS = 6000;
+// ステータス行の最大件数。連打したときに何件目の応答かが分かればよい
+const MAX_STATUS_ROWS = 3;
 
 /** foxglove.UiControl に対応する型。proto3 のデフォルト値を埋めた正規化済みの形 */
 interface UiControl {
@@ -37,6 +45,8 @@ interface UiControl {
   columns: number;
   min: number;
   max: number;
+  /** 押すと取り返しがつかない操作か。立っていたら二段階で実行する */
+  confirm: boolean;
 }
 
 /** パネルに永続化する状態 */
@@ -54,10 +64,23 @@ const defaultState: PanelState = {
   showParameterNames: false,
 };
 
-type StatusKind = "info" | "error";
+type StatusKind = "info" | "error" | "pending";
+
+/**
+ * ステータス行1件。
+ *
+ * <p>意味は「サービス呼び出しの結果と失敗」に揃えてある。
+ * parameter の書き込みは現在値がコントロール自身に映るので、ここには出さない。
+ */
 interface Status {
+  /** 呼び出し中の行を、応答が返った時点で置き換えるための識別子 */
+  id: number;
   kind: StatusKind;
   text: string;
+  /** mm:ss。連打したとき、どれが新しい応答かを読むために付ける */
+  time: string;
+  /** この時刻を過ぎたら消す。エラーは undefined にして残す */
+  expiresAt?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -101,6 +124,7 @@ function normalizeControl(raw: unknown): UiControl | undefined {
     columns: Math.trunc(toNumber(src["columns"], 0)),
     min: toNumber(src["min"], 0),
     max: toNumber(src["max"], 0),
+    confirm: src["confirm"] === true,
   };
 }
 
@@ -308,6 +332,7 @@ const colors = {
   accentText: "#ffffff",
   error: "#e05252",
   muted: "rgba(127, 127, 127, 1)",
+  danger: "#d9534f",
 };
 
 const rootStyle: React.CSSProperties = {
@@ -354,6 +379,33 @@ const controlLabelStyle: React.CSSProperties = {
 const inputColors = {
   dark: { background: "#2f2f2f", color: "#e8e8e8" },
   light: { background: "#ffffff", color: "#1a1a1a" },
+};
+
+/**
+ * ステータス行を置く帯。
+ *
+ * <p>パネル最下部だと、セクションを開いているときにスクロールしないと見えない。
+ * ルート要素がスクロール領域なので sticky で上端に貼り付ける。
+ * <b>背景は不透明にすること。</b> 半透明だと下を流れる中身が透けて読めなくなる。
+ */
+function statusBarStyle(isDark: boolean): React.CSSProperties {
+  return {
+    position: "sticky",
+    top: 0,
+    zIndex: 1,
+    background: isDark ? inputColors.dark.background : inputColors.light.background,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 4,
+    marginBottom: 8,
+    padding: "4px 6px",
+  };
+}
+
+const statusRowStyle: React.CSSProperties = {
+  alignItems: "baseline",
+  display: "flex",
+  gap: 6,
+  lineHeight: 1.5,
 };
 
 function inputStyle(isDark: boolean): React.CSSProperties {
@@ -420,6 +472,23 @@ const PANEL_CSS = `
 .rdcp-b.rdcp-act:hover { background: rgba(127, 127, 127, 0.26); }
 .rdcp-b:disabled { cursor: default; opacity: 0.45; }
 .rdcp-b:disabled:hover { background: transparent; }
+/* 押すと取り返しがつかない操作。
+   色だけで分けると色覚によっては読み取れないので、輪郭を二重線にして形でも分ける */
+.rdcp-b.rdcp-danger {
+  background: transparent;
+  border: 3px double ${colors.danger};
+  border-radius: 999px;
+  color: ${colors.danger};
+  padding: 3px 12px;
+}
+.rdcp-b.rdcp-danger:hover { background: rgba(217, 83, 79, 0.16); }
+/* 1回目のクリックで構えた状態。塗って、押せば実行されることを明示する */
+.rdcp-b.rdcp-danger.rdcp-armed {
+  background: ${colors.danger};
+  color: #ffffff;
+  font-weight: 700;
+}
+.rdcp-b.rdcp-danger.rdcp-armed:hover { background: ${colors.danger}; }
 /* ON/OFF の2分割トグル。隣り合う辺の角と枠線を潰して1つの部品に見せる */
 .rdcp-seg-l { border-radius: 3px 0 0 3px; }
 .rdcp-seg-r { border-radius: 0 3px 3px 0; margin-left: -1px; }
@@ -748,26 +817,60 @@ const ServiceButtonRow: React.FC<{
   controls: UiControl[];
   pending: ReadonlySet<string>;
   onCallService: (service: string, payload: string) => void;
-}> = ({ controls, pending, onCallService }) => (
-  <div style={{ ...controlRowStyle, display: "flex", flexWrap: "wrap", gap: 4 }}>
-    {controls.map((control, index) => {
-      const busy = pending.has(control.service);
-      return (
-        <button
-          key={`${control.service}-${index}`}
-          disabled={busy}
-          title={`${control.service} ${control.payload}`.trim()}
-          className="rdcp-b rdcp-act"
-          onClick={() => {
-            onCallService(control.service, control.payload);
-          }}
-        >
-          {control.label.length > 0 ? control.label : control.service}
-        </button>
-      );
-    })}
-  </div>
-);
+}> = ({ controls, pending, onCallService }) => {
+  // confirm 付きボタンのうち、いま構えているもの。一定時間で自動的に戻す。
+  // ダイアログを出さないのは、モーダルを閉じる操作がもう1つ増えるうえ、
+  // 押した場所から目線が飛ぶため
+  const [armed, setArmed] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    if (armed == undefined) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      setArmed(undefined);
+    }, CONFIRM_TIMEOUT_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [armed]);
+
+  return (
+    <div style={{ ...controlRowStyle, display: "flex", flexWrap: "wrap", gap: 4 }}>
+      {controls.map((control, index) => {
+        const key = `${control.service}-${index}`;
+        const busy = pending.has(control.service);
+        const isArmed = armed === key;
+        const label = control.label.length > 0 ? control.label : control.service;
+        const style = control.confirm
+          ? `rdcp-b rdcp-danger${isArmed ? " rdcp-armed" : ""}`
+          : "rdcp-b rdcp-act";
+        return (
+          <button
+            key={key}
+            disabled={busy}
+            title={`${control.service} ${control.payload}`.trim()}
+            className={style}
+            onClick={() => {
+              if (!control.confirm) {
+                onCallService(control.service, control.payload);
+                return;
+              }
+              if (!isArmed) {
+                setArmed(key);
+                return;
+              }
+              setArmed(undefined);
+              onCallService(control.service, control.payload);
+            }}
+          >
+            {isArmed ? `${label}?` : label}
+          </button>
+        );
+      })}
+    </div>
+  );
+};
 
 /** group 内のコントロールを描画単位に分ける。連続する button は1行にまとめる */
 type Row =
@@ -803,6 +906,13 @@ function summarizeResponse(response: unknown): string {
   return text.length > 200 ? `${text.slice(0, 200)}…` : text;
 }
 
+/** ステータス行に添える mm:ss */
+function clockLabel(at: Date): string {
+  const mm = String(at.getMinutes()).padStart(2, "0");
+  const ss = String(at.getSeconds()).padStart(2, "0");
+  return `${mm}:${ss}`;
+}
+
 /** 応答が {"success": false} を含むか。HTTP と違い呼び出し自体は成功して返ってくる */
 function isFailureResponse(response: unknown): boolean {
   return (
@@ -823,7 +933,10 @@ const UiControlPanel: React.FC<{ context: PanelExtensionContext }> = ({ context 
     undefined | Immutable<Map<string, ParameterValue>>
   >();
   const [topics, setTopics] = useState<undefined | Immutable<Topic[]>>();
-  const [status, setStatus] = useState<Status | undefined>();
+  // 直近の数件を新しい順に持つ。1件だけだと、連打したときに
+  // 成功がエラーを上書きして失敗に気づけない
+  const [statuses, setStatuses] = useState<Status[]>([]);
+  const nextStatusId = useRef(1);
   // 呼び出し中のサービス名。連打で同じ要求を積まないようにボタンを無効化する
   const [pending, setPending] = useState<ReadonlySet<string>>(new Set());
   const [renderDone, setRenderDone] = useState<(() => void) | undefined>();
@@ -924,34 +1037,94 @@ const UiControlPanel: React.FC<{ context: PanelExtensionContext }> = ({ context 
 
   // --- 操作ハンドラ ---------------------------------------------------------
 
+  /** 行を1件足して id を返す。新しいものが上、多すぎる古いものは落とす */
+  const pushStatus = useCallback((kind: StatusKind, text: string): number => {
+    const id = nextStatusId.current++;
+    const now = Date.now();
+    // エラーは消さない。見落とすと、操作したつもりで何も起きていない状態が続く
+    const expiresAt = kind === "error" ? undefined : now + STATUS_FADE_MS;
+    setStatuses((prev) =>
+      [{ id, kind, text, time: clockLabel(new Date(now)), expiresAt }, ...prev].slice(
+        0,
+        MAX_STATUS_ROWS,
+      ),
+    );
+    return id;
+  }, []);
+
+  /** 呼び出し中の行を、応答が返った時点で結果に置き換える */
+  const settleStatus = useCallback((id: number, kind: StatusKind, text: string) => {
+    setStatuses((prev) =>
+      prev.map((entry) =>
+        entry.id === id
+          ? {
+              ...entry,
+              kind,
+              text,
+              time: clockLabel(new Date()),
+              expiresAt: kind === "error" ? undefined : Date.now() + STATUS_FADE_MS,
+            }
+          : entry,
+      ),
+    );
+  }, []);
+
+  const dismissStatus = useCallback((id: number) => {
+    setStatuses((prev) => prev.filter((entry) => entry.id !== id));
+  }, []);
+
+  // 期限が来た行を落とす。**取り除くものが無ければ元の配列を返すこと。**
+  // 毎回新しい配列を返すと、この useEffect が自分の setStatuses で再入して回り続ける
+  useEffect(() => {
+    let soonest: number | undefined;
+    for (const entry of statuses) {
+      if (entry.expiresAt == undefined) continue;
+      if (soonest == undefined || entry.expiresAt < soonest) soonest = entry.expiresAt;
+    }
+    if (soonest == undefined) {
+      return;
+    }
+    const timer = setTimeout(
+      () => {
+        setStatuses((prev) => {
+          const now = Date.now();
+          const kept = prev.filter((entry) => entry.expiresAt == undefined || entry.expiresAt > now);
+          return kept.length === prev.length ? prev : kept;
+        });
+      },
+      Math.max(0, soonest - Date.now()) + 20,
+    );
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [statuses]);
+
   const handleSetParameter = useCallback(
     (name: string, value: ParameterValue) => {
       if (name.length === 0) {
-        setStatus({ kind: "error", text: "parameter 名が空のコントロールです" });
+        pushStatus("error", "parameter 名が空のコントロールです");
         return;
       }
       try {
         context.setParameter(name, value);
-        setStatus({ kind: "info", text: `${name} = ${String(value)}` });
+        // 成功は出さない。現在値はコントロール自身がハイライトで映すので、
+        // ここに出すとサービスの結果が押し流されて読めなくなる
       } catch (error) {
-        setStatus({ kind: "error", text: `${name} の設定に失敗: ${String(error)}` });
+        pushStatus("error", `${name} の設定に失敗: ${String(error)}`);
       }
     },
-    [context],
+    [context, pushStatus],
   );
 
   const handleCallService = useCallback(
     (service: string, payload: string) => {
       const callService = context.callService;
       if (!callService) {
-        setStatus({
-          kind: "error",
-          text: "この接続はサービス呼び出しに対応していません",
-        });
+        pushStatus("error", "この接続はサービス呼び出しに対応していません");
         return;
       }
       if (service.length === 0) {
-        setStatus({ kind: "error", text: "service 名が空のコントロールです" });
+        pushStatus("error", "service 名が空のコントロールです");
         return;
       }
       let request: unknown = {};
@@ -959,11 +1132,11 @@ const UiControlPanel: React.FC<{ context: PanelExtensionContext }> = ({ context 
         try {
           request = JSON.parse(payload);
         } catch (error) {
-          setStatus({ kind: "error", text: `payload の JSON が不正: ${String(error)}` });
+          pushStatus("error", `payload の JSON が不正: ${String(error)}`);
           return;
         }
       }
-      setStatus({ kind: "info", text: `${service} を呼び出し中…` });
+      const id = pushStatus("pending", `${service} を呼び出し中…`);
       setPending((prev) => new Set(prev).add(service));
       const finish = () => {
         setPending((prev) => {
@@ -977,18 +1150,19 @@ const UiControlPanel: React.FC<{ context: PanelExtensionContext }> = ({ context 
           finish();
           // 呼び出し自体は成功しても、応答が success:false を返すことがある
           const summary = summarizeResponse(response);
-          setStatus({
-            kind: isFailureResponse(response) ? "error" : "info",
-            text: `${service}: ${summary.length > 0 ? summary : "OK"}`,
-          });
+          settleStatus(
+            id,
+            isFailureResponse(response) ? "error" : "info",
+            `${service}: ${summary.length > 0 ? summary : "OK"}`,
+          );
         },
         (error: unknown) => {
           finish();
-          setStatus({ kind: "error", text: `${service} の呼び出しに失敗: ${String(error)}` });
+          settleStatus(id, "error", `${service} の呼び出しに失敗: ${String(error)}`);
         },
       );
     },
-    [context],
+    [context, pushStatus, settleStatus],
   );
 
   const toggleGroup = useCallback((group: string) => {
@@ -1027,6 +1201,41 @@ const UiControlPanel: React.FC<{ context: PanelExtensionContext }> = ({ context 
   return (
     <div style={rootStyle}>
       <style>{PANEL_CSS}</style>
+
+      {statuses.length > 0 && (
+        <div style={statusBarStyle(isDark)}>
+          {statuses.map((entry) => (
+            <div key={entry.id} style={statusRowStyle}>
+              <span style={{ color: colors.muted, flex: "none" }}>{entry.time}</span>
+              <span style={{ color: colors.muted, flex: "none" }}>
+                {entry.kind === "pending" ? "…" : entry.kind === "error" ? "×" : "✓"}
+              </span>
+              <span
+                style={{
+                  color: entry.kind === "error" ? colors.error : "inherit",
+                  opacity: entry.kind === "pending" ? 0.7 : 1,
+                  wordBreak: "break-all",
+                }}
+              >
+                {entry.text}
+              </span>
+              {entry.kind === "error" && (
+                <button
+                  className="rdcp-b rdcp-head"
+                  style={{ color: colors.muted, marginLeft: "auto", padding: "0 4px" }}
+                  title="この行を閉じる"
+                  onClick={() => {
+                    dismissStatus(entry.id);
+                  }}
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
       {controls == undefined && (
         <div style={{ opacity: 0.7, padding: 8 }}>
           {topicExists
@@ -1086,18 +1295,6 @@ const UiControlPanel: React.FC<{ context: PanelExtensionContext }> = ({ context 
         );
       })}
 
-      {status && (
-        <div
-          style={{
-            color: status.kind === "error" ? colors.error : colors.muted,
-            marginTop: 4,
-            padding: "2px 4px",
-            wordBreak: "break-all",
-          }}
-        >
-          {status.text}
-        </div>
-      )}
     </div>
   );
 };
