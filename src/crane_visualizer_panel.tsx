@@ -212,6 +212,41 @@ const defaultConfig: PanelConfig = {
   namespaces: {},
 };
 
+/**
+ * 名前空間ツリーの1ノードの表示状態を変えた新しいツリーを返す。
+ *
+ * <p><b>根から対象ノードまでを複製する。</b> 浅いコピーだと子の参照を共有したまま
+ * 書き換えることになり、参照が変わらないノードの変更が保存されない。
+ *
+ * <p>対象が見つからない、または値が変わらない場合は元のオブジェクトをそのまま返す。
+ * 呼び出し側が参照の同一性で「変化なし」を判定し、無駄な再描画と saveState を避けられる。
+ */
+function withNamespaceVisible(
+  namespaces: PanelConfig["namespaces"],
+  path: readonly string[],
+  visible: boolean,
+): PanelConfig["namespaces"] {
+  const [head, ...rest] = path;
+  if (head == undefined) {
+    return namespaces;
+  }
+  const node = namespaces[head];
+  if (!node) {
+    return namespaces;
+  }
+  if (rest.length === 0) {
+    return node.visible === visible ? namespaces : { ...namespaces, [head]: { ...node, visible } };
+  }
+  const children = node.children;
+  if (!children) {
+    return namespaces;
+  }
+  const nextChildren = withNamespaceVisible(children, rest, visible);
+  return nextChildren === children
+    ? namespaces
+    : { ...namespaces, [head]: { ...node, children: nextChildren } };
+}
+
 const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   context,
 }) => {
@@ -659,14 +694,25 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
                 setConfig((prevConfig) => ({ ...prevConfig, viewBoxWidth: action.payload.value as number }));
               }
               else if (action.payload.path[0] == "namespaces") {
-                const pathParts = path.split(".");
-                const namespacePath = pathParts.slice(1, -1);
-                const leafNamespace = pathParts[pathParts.length - 1]!;
-                let currentNs = config.namespaces;
-                for (const ns of namespacePath) {
-                  currentNs = currentNs[ns]!.children || {};
-                }
-                currentNs[leafNamespace]!.visible = action.payload.value as boolean;
+                // ⚠️ config.namespaces を直接書き換えてはいけない。
+                // 参照が変わらないと saveState を持つ useLayoutEffect が再実行されず、
+                // 切替がパネル状態に保存されない。絵は毎フレーム読み直すので
+                // 見た目だけは正しく変わり、保存されていないことに気づけない。
+                //
+                // path をそのまま使う。join(".") してから split(".") すると
+                // レイヤー名にドットが入った瞬間に壊れる
+                const namespacePath = action.payload.path.slice(1);
+                const visible = action.payload.value as boolean;
+                setConfig((prevConfig) => {
+                  const namespaces = withNamespaceVisible(
+                    prevConfig.namespaces,
+                    namespacePath,
+                    visible,
+                  );
+                  return namespaces === prevConfig.namespaces
+                    ? prevConfig
+                    : { ...prevConfig, namespaces };
+                });
               }
               break;
             case "perform-node-action":
