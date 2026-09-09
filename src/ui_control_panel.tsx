@@ -143,6 +143,50 @@ function valueToComparable(value: Immutable<ParameterValue>): string | undefined
   }
 }
 
+/**
+ * int 配列の parameter を ID の集合にする。配列でなければ undefined。
+ *
+ * <p>ws-protocol は数値を number で返すが、実装によっては文字列で来ることがある。
+ * 比較を取りこぼさないよう Number() で正規化してから集合にする。
+ */
+function toIdSet(value: Immutable<ParameterValue>): Set<number> | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const ids = new Set<number>();
+  for (const entry of value) {
+    const id = Number(entry);
+    if (Number.isFinite(id)) {
+      ids.add(Math.trunc(id));
+    }
+  }
+  return ids;
+}
+
+/**
+ * payload の JSON に ids を足した文字列を作る。
+ *
+ * <p>サーバーは差分ではなく<b>有効な ID の全体</b>を受け取る仕様なので、
+ * 呼び出しのたびにトグル後の一覧をそのまま送る。
+ * payload が壊れている場合は手を加えずに返し、呼び出し側にエラーを出させる。
+ */
+function payloadWithIds(payload: string, ids: number[]): string {
+  let base: Record<string, unknown> = {};
+  if (payload.trim().length > 0) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      return payload;
+    }
+    if (parsed == undefined || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return payload;
+    }
+    base = parsed as Record<string, unknown>;
+  }
+  return JSON.stringify({ ...base, ids });
+}
+
 function isTruthyParameter(value: Immutable<ParameterValue>): boolean {
   if (typeof value === "boolean") {
     return value;
@@ -398,6 +442,9 @@ interface ControlProps {
   currentValue: Immutable<ParameterValue>;
   showParameterName: boolean;
   onSetParameter: (name: string, value: ParameterValue) => void;
+  /** 呼び出し中のサービス名。id_toggles のように service を呼ぶ kind で使う */
+  pending: ReadonlySet<string>;
+  onCallService: (service: string, payload: string) => void;
 }
 
 const ControlRow: React.FC<ControlProps> = ({
@@ -406,6 +453,8 @@ const ControlRow: React.FC<ControlProps> = ({
   currentValue,
   showParameterName,
   onSetParameter,
+  pending,
+  onCallService,
 }) => {
   // 数値入力は編集途中の文字列をローカルに持つ（"1." のような中間状態を許すため）
   const [draft, setDraft] = useState<string | undefined>(undefined);
@@ -587,6 +636,82 @@ const ControlRow: React.FC<ControlProps> = ({
               </option>
             ))}
           </select>
+        );
+      }
+
+      case "id_toggles": {
+        // 現在値は parameter（int 配列）から読み、書き込みは service で行う。
+        // parameter に直接書くとサーバー側の SimulatorSync を通らず、
+        // 設定だけが変わってシミュレータのロボットが場に残る
+        const from = Math.ceil(control.min);
+        const to = Math.floor(control.max);
+        const count = to - from + 1;
+        if (count <= 0 || count > MAX_RANGE_OPTIONS) {
+          return (
+            <div style={{ color: colors.error }}>
+              id_toggles の範囲が不正です: {control.min}..{control.max}
+            </div>
+          );
+        }
+        const ids = Array.from({ length: count }, (_, index) => from + index);
+        const active = toIdSet(currentValue);
+        const busy = pending.has(control.service);
+        const send = (next: number[]) => {
+          onCallService(control.service, payloadWithIds(control.payload, next));
+        };
+        const layout: React.CSSProperties =
+          control.columns > 0
+            ? {
+                display: "grid",
+                gap: 4,
+                gridTemplateColumns: `repeat(${control.columns}, minmax(0, 1fr))`,
+              }
+            : { display: "flex", flexWrap: "wrap", gap: 4 };
+        return (
+          <div>
+            <div style={layout}>
+              {ids.map((id) => {
+                const selected = active?.has(id) ?? false;
+                return (
+                  <button
+                    key={id}
+                    // 現在値が読めないうちは差分を作れないので押させない
+                    disabled={busy || active == undefined}
+                    className={buttonClass(selected)}
+                    onClick={() => {
+                      send(
+                        ids.filter((other) =>
+                          other === id ? !selected : (active?.has(other) ?? false),
+                        ),
+                      );
+                    }}
+                  >
+                    {id}
+                  </button>
+                );
+              })}
+            </div>
+            <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
+              <button
+                className="rdcp-b rdcp-act"
+                disabled={busy}
+                onClick={() => {
+                  send(ids);
+                }}
+              >
+                All
+              </button>
+              <button
+                className="rdcp-b rdcp-act"
+                disabled={busy}
+                onClick={() => {
+                  send([]);
+                }}
+              >
+                None
+              </button>
+            </div>
+          </div>
         );
       }
 
@@ -952,6 +1077,8 @@ const UiControlPanel: React.FC<{ context: PanelExtensionContext }> = ({ context 
                     }
                     showParameterName={state.showParameterNames}
                     onSetParameter={handleSetParameter}
+                    pending={pending}
+                    onCallService={handleCallService}
                   />
                 ),
               )}
