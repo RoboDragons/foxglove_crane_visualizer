@@ -168,6 +168,13 @@ interface PanelConfig {
   aggregatedTopic: string; // /aggregated_svgsトピック名
   updateTopic: string; // /visualizer_svgsトピック名
   enableUpdateTopic: boolean; // /visualizer_svgsトピックの有効/無効
+  // 描画モード（遅さの切り分け用）。**既定は normal で従来どおり。**
+  // どのモードでも受信・履歴・MCAP への記録には影響しない
+  // （MCAP はサーバー側の Sink が書くので、ここで何を描くかとログの中身は無関係）。
+  //   normal       : 全レイヤーを描く（非表示レイヤーは display:none）
+  //   visible-only : 表示中のレイヤーだけ要素を作る
+  //   off          : 何も描かない
+  renderMode: "normal" | "visible-only" | "off";
   maxHistoryDuration: number; // 履歴保持期間（秒）
   maxHistorySize: number; // 最大履歴サイズ
   namespaces: {
@@ -185,6 +192,7 @@ const defaultConfig: PanelConfig = {
   aggregatedTopic: "/aggregated_svgs",
   updateTopic: "/visualizer_svgs",
   enableUpdateTopic: true,
+  renderMode: "normal",
   // 差分は毎秒 40 件前後・1件 30KB 程度届く。履歴はシークの起点を確保するためだけの
   // ものなので短くてよい（スナップショットが 1Hz で来るため数秒あれば足りる）
   maxHistoryDuration: 30, // 30秒間
@@ -617,6 +625,17 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
           display: {
             label: "表示設定",
             fields: {
+              renderMode: {
+                label: "描画モード",
+                input: "select",
+                value: config.renderMode,
+                options: [
+                  { label: "通常", value: "normal" },
+                  { label: "表示中のみ要素を作る", value: "visible-only" },
+                  { label: "描画しない（計測用）", value: "off" },
+                ],
+                help: "遅さの切り分け用。変えても受信とログ記録には影響しない",
+              },
               backgroundColor: { 
                 label: "背景色", 
                 input: "rgba", 
@@ -645,6 +664,8 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
                 setConfig((prevConfig) => ({ ...prevConfig, updateTopic: action.payload.value as string }));
               } else if (path == "topics.enableUpdateTopic") {
                 setConfig((prevConfig) => ({ ...prevConfig, enableUpdateTopic: action.payload.value as boolean }));
+              } else if (path == "display.renderMode") {
+                setConfig((prevConfig) => ({ ...prevConfig, renderMode: action.payload.value as PanelConfig["renderMode"] }));
               } else if (path == "performance.maxHistoryDuration") {
                 setConfig((prevConfig) => ({ ...prevConfig, maxHistoryDuration: action.payload.value as number }));
               } else if (path == "performance.maxHistorySize") {
@@ -955,7 +976,15 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
               ? (currentDisplayMsg ?? latest_msg)
               : latest_msg;
 
-            return displayMsg?.svg_primitive_arrays.map((svg_primitive_array) => (
+            // 描画モードは遅さの切り分け用。既定（normal）は従来どおり全レイヤーを描く
+            if (config.renderMode === "off") return null;
+
+            const arrays = config.renderMode === "visible-only"
+              ? displayMsg?.svg_primitive_arrays.filter(
+                  (array) => config.namespaces[array.layer]?.visible)
+              : displayMsg?.svg_primitive_arrays;
+
+            return arrays?.map((svg_primitive_array) => (
               <g key={svg_primitive_array.layer} style={{ display: config.namespaces[svg_primitive_array.layer]?.visible ? 'block' : 'none' }}>
                 {svg_primitive_array.svg_primitives.map((svg_primitive, svgIndex) => (
                   <g key={svgIndex} dangerouslySetInnerHTML={{ __html: svg_primitive }} />
