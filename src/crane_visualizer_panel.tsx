@@ -129,7 +129,7 @@ const joinedHtml = (primitives: string[]): string => {
 // 「直したはずなのに反映されていない」を一目で判別するためにパネル上部へ出す。
 // 拡張のインストールはビルドを伴わず、入れ先も実行環境のホームなので、
 // 古いビルドが黙って読まれることが実際に何度も起きた。
-const BUILD_TAG = "85f5509-0909-1510";
+const BUILD_TAG = "87cec66-0909-1531";
 
 // シークとみなす巻き戻り量[ms]。
 // ライブ受信でも currentTime と receiveTime は数 ms ずれるので、
@@ -192,11 +192,15 @@ interface PanelConfig {
   //   normal       : 全レイヤーを描く（非表示レイヤーは display:none）
   //   visible-only : 表示中のレイヤーだけ要素を作る（**既定**）
   //   off          : 何も描かない
+  //   static       : 全レイヤーを1度だけ描き、以後 DOM を更新しない（切り分け用）
+  //
+  // static は「要素数が重いのか、毎フレーム作り直しているのが重いのか」を分ける。
+  // 全 484 要素を出したまま 60fps 近く出るなら、コストは作り直し側にある。
   //
   // 既定が visible-only なのは実測から。display:none はレイアウトと描画は飛ばすが、
   // **DOM 構築とスタイル再計算は飛ばさない**ので、見えないレイヤーにフレームの
   // 半分（83ms 中 43ms）を払っていた。normal / off は切り分け用に残してある。
-  renderMode: "normal" | "visible-only" | "off";
+  renderMode: "normal" | "visible-only" | "off" | "static";
   maxHistoryDuration: number; // 履歴保持期間（秒）
   maxHistorySize: number; // 最大履歴サイズ
   namespaces: {
@@ -250,6 +254,8 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   const lastAppliedTimeRef = useRef<number>(-1);
   // 組み直しに失敗した回数（診断用）。増え続けるならシーク判定が誤発火している
   const recomposeFailureRef = useRef<number>(0);
+  // static モードで固定したレイヤー（切り分け用）
+  const frozenArraysRef = useRef<SvgPrimitiveArray[] | undefined>(undefined);
 
   // 描画性能の計測（診断用）。
   // 「トピックは 50〜60Hz 来ているのに画面がもっさり」を切り分けるためのもの。
@@ -589,6 +595,11 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     namespacesRef.current = config.namespaces;
   }, [config.namespaces]);
 
+  // モードを切り替えたら固定を解除する（次に static にしたとき最新で固定し直す）
+  useEffect(() => {
+    if (config.renderMode !== "static") frozenArraysRef.current = undefined;
+  }, [config.renderMode]);
+
   useLayoutEffect(() => {
     context.saveState(config);
   }, [config, context]);
@@ -655,6 +666,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
                   { label: "通常", value: "normal" },
                   { label: "表示中のみ要素を作る", value: "visible-only" },
                   { label: "描画しない（計測用）", value: "off" },
+                  { label: "静止・全レイヤー（計測用）", value: "static" },
                 ],
                 help: "遅さの切り分け用。変えても受信とログ記録には影響しない",
               },
@@ -1002,10 +1014,19 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
             // 描画モードは遅さの切り分け用。既定（normal）は従来どおり全レイヤーを描く
             if (config.renderMode === "off") return null;
 
-            const arrays = config.renderMode === "visible-only"
-              ? displayMsg?.svg_primitive_arrays.filter(
-                  (array) => config.namespaces[array.layer]?.visible)
-              : displayMsg?.svg_primitive_arrays;
+            let arrays: SvgPrimitiveArray[] | undefined;
+            if (config.renderMode === "static") {
+              // 最初に届いた全レイヤーで固定する。以後 DOM は一切更新されない
+              if (!frozenArraysRef.current && displayMsg) {
+                frozenArraysRef.current = displayMsg.svg_primitive_arrays;
+              }
+              arrays = frozenArraysRef.current;
+            } else if (config.renderMode === "visible-only") {
+              arrays = displayMsg?.svg_primitive_arrays.filter(
+                (array) => config.namespaces[array.layer]?.visible);
+            } else {
+              arrays = displayMsg?.svg_primitive_arrays;
+            }
 
             // **プリミティブ1つずつではなく、レイヤーごとに1回だけ innerHTML を張る。**
             // 1つずつだと要素数だけ HTML パースとラッパー <g> が増える
