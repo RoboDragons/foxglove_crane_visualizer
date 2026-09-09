@@ -2,3 +2,4 @@ node_modules/
 *.foxe
 package-lock.json
 dist/
+.check/

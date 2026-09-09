@@ -4,12 +4,20 @@ import {
   PanelExtensionContext,
   SettingsTree,
   SettingsTreeAction,
-  SettingsTreeField,
+  SettingsTreeNodes,
   Subscription
 } from "@foxglove/studio";
 import * as React from "react";
 import { StrictMode, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactDOM from "react-dom";
+import {
+  NamespaceMap,
+  collectVisibleLayers,
+  hasNamespaceNode,
+  migrateNamespaces,
+  withLayerAdded,
+  withNamespaceVisible,
+} from "./namespace_tree";
 
 // 送信データの型定義
 type MouseStateType = "DOWN" | "UP" | "MOVE" | null;
@@ -190,12 +198,7 @@ interface PanelConfig {
   enableUpdateTopic: boolean; // /visualizer_svgsトピックの有効/無効
   maxHistoryDuration: number; // 履歴保持期間（秒）
   maxHistorySize: number; // 最大履歴サイズ
-  namespaces: {
-    [key: string]: {
-      visible: boolean;
-      children?: { [key: string]: { visible: boolean; children?: any } };
-    };
-  };
+  namespaces: NamespaceMap;
 }
 
 const defaultConfig: PanelConfig = {
@@ -211,41 +214,6 @@ const defaultConfig: PanelConfig = {
   maxHistorySize: 300, // 最大300メッセージ
   namespaces: {},
 };
-
-/**
- * 名前空間ツリーの1ノードの表示状態を変えた新しいツリーを返す。
- *
- * <p><b>根から対象ノードまでを複製する。</b> 浅いコピーだと子の参照を共有したまま
- * 書き換えることになり、参照が変わらないノードの変更が保存されない。
- *
- * <p>対象が見つからない、または値が変わらない場合は元のオブジェクトをそのまま返す。
- * 呼び出し側が参照の同一性で「変化なし」を判定し、無駄な再描画と saveState を避けられる。
- */
-function withNamespaceVisible(
-  namespaces: PanelConfig["namespaces"],
-  path: readonly string[],
-  visible: boolean,
-): PanelConfig["namespaces"] {
-  const [head, ...rest] = path;
-  if (head == undefined) {
-    return namespaces;
-  }
-  const node = namespaces[head];
-  if (!node) {
-    return namespaces;
-  }
-  if (rest.length === 0) {
-    return node.visible === visible ? namespaces : { ...namespaces, [head]: { ...node, visible } };
-  }
-  const children = node.children;
-  if (!children) {
-    return namespaces;
-  }
-  const nextChildren = withNamespaceVisible(children, rest, visible);
-  return nextChildren === children
-    ? namespaces
-    : { ...namespaces, [head]: { ...node, children: nextChildren } };
-}
 
 const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   context,
@@ -605,7 +573,12 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   useLayoutEffect(() => {
     const savedConfig = context.initialState as PanelConfig | undefined;
     if (savedConfig) {
-      setConfig((prevConfig) => ({ ...prevConfig, ...savedConfig, namespaces: savedConfig.namespaces || prevConfig.namespaces }));
+      setConfig((prevConfig) => ({
+        ...prevConfig,
+        ...savedConfig,
+        // 平坦だった頃の保存状態はここでツリーへ移す
+        namespaces: migrateNamespaces(savedConfig.namespaces ?? prevConfig.namespaces),
+      }));
     }
   }, [context, setConfig]);
 
@@ -671,7 +644,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
           },
           namespaces: {
             label: "名前空間（レイヤー表示制御）",
-            fields: createNamespaceFields(config.namespaces),
+            children: createNamespaceNodes(config.namespaces),
           },
         },
         actionHandler: (action: SettingsTreeAction) => {
@@ -701,7 +674,14 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
                 //
                 // path をそのまま使う。join(".") してから split(".") すると
                 // レイヤー名にドットが入った瞬間に壊れる
-                const namespacePath = action.payload.path.slice(1);
+                const rest = action.payload.path.slice(1);
+                // ノードの目のアイコンは path の末尾に "visible" を足して送ってくる。
+                // フィールドとして出した場合は足されない。実在するノードを優先して
+                // 見分けることで、"visible" という名前のレイヤーが来ても取り違えない
+                const namespacePath =
+                  hasNamespaceNode(config.namespaces, rest) || rest[rest.length - 1] !== "visible"
+                    ? rest
+                    : rest.slice(0, -1);
                 const visible = action.payload.value as boolean;
                 setConfig((prevConfig) => {
                   const namespaces = withNamespaceVisible(
@@ -726,25 +706,29 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     updatePanelSettings();
   }, [context, config]);
 
-  const createNamespaceFields = (namespaces: PanelConfig["namespaces"]) => {
-    const fields: { [key: string]: SettingsTreeField } = {};
-    const addFieldsRecursive = (ns: { [key: string]: any }, path: string[] = []) => {
-      for (const [name, { visible, children }] of Object.entries(ns)) {
-        const currentPath = [...path, name];
-        const key = currentPath.join(".");
-        fields[key] = {
-          label: name,
-          input: "boolean",
-          value: visible,
-          help: "名前空間の表示/非表示",
-        };
-        if (children) {
-          addFieldsRecursive(children, currentPath);
-        }
-      }
-    };
-    addFieldsRecursive(namespaces);
-    return fields;
+  /**
+   * 名前空間ツリーを Studio の設定ツリーのノードに写す。
+   *
+   * <p>`visible` を持たせると、Studio が目のアイコンを出して切替の action を送ってくる。
+   * 標準の 3D パネルと同じ操作感になる。
+   *
+   * <p>`order` を明示するのは、ECMA のキー順では数字だけの名前
+   * （`obstacles/blue/0` の `0`）が先に来てしまうため。
+   * サーバーが送ってくる描画順をそのまま出したい。
+   */
+  const createNamespaceNodes = (namespaces: PanelConfig["namespaces"]): SettingsTreeNodes => {
+    const nodes: SettingsTreeNodes = {};
+    let index = 0;
+    for (const [name, node] of Object.entries(namespaces)) {
+      nodes[name] = {
+        label: name,
+        visible: node.visible,
+        order: index++,
+        defaultExpansionState: "collapsed",
+        children: node.children ? createNamespaceNodes(node.children) : undefined,
+      };
+    }
+    return nodes;
   };
 
   useLayoutEffect(() => {
@@ -857,6 +841,10 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     renderDone?.();
   }, [renderDone]);
 
+  // 表示中のレイヤー名。**毎フレーム引くのでツリーを歩き直さない。**
+  // 1フレームに 30 レイヤー分の判定が要るので、namespaces が変わったときだけ作り直す
+  const visibleLayers = useMemo(() => collectVisibleLayers(config.namespaces), [config.namespaces]);
+
   // currentDisplayMsg に含まれる新規レイヤーを namespaces に反映
   //
   // **新しいレイヤーが無いフレームでは prevConfig をそのまま返すこと。**
@@ -865,16 +853,18 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   useEffect(() => {
     if (!currentDisplayMsg) return;
     setConfig((prevConfig) => {
-      let added = false;
-      const newNamespaces = { ...prevConfig.namespaces };
+      let namespaces = prevConfig.namespaces;
+      // サーバーが送ってくる順（SvgRenderer の挿入順）で足す。
+      // オブジェクトのキー順がそのまま設定ツリーの並びになるので、
+      // 初出順ではなく描画順に揃うことになる
       currentDisplayMsg.svg_primitive_arrays.forEach((svg_primitive_array) => {
-        if (!newNamespaces[svg_primitive_array.layer]) {
-          const defaultVisibility = svg_primitive_array.config?.visible_by_default ?? true;
-          newNamespaces[svg_primitive_array.layer] = { visible: defaultVisibility };
-          added = true;
-        }
+        namespaces = withLayerAdded(
+          namespaces,
+          svg_primitive_array.layer,
+          svg_primitive_array.config?.visible_by_default ?? true,
+        );
       });
-      return added ? { ...prevConfig, namespaces: newNamespaces } : prevConfig;
+      return namespaces === prevConfig.namespaces ? prevConfig : { ...prevConfig, namespaces };
     });
   }, [currentDisplayMsg]);
 
@@ -980,7 +970,7 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
             // DOM 構築とスタイル再計算は飛ばさない。実測では、画面に出ていない
             // 400 プリミティブにフレームの半分（83ms 中 43ms）を払っていた。
             const arrays = displayMsg?.svg_primitive_arrays.filter(
-              (array) => config.namespaces[array.layer]?.visible);
+              (array) => visibleLayers.has(array.layer));
 
             // **プリミティブ1つずつではなく、レイヤーごとに1回だけ innerHTML を張る。**
             // 1つずつだと要素数だけ HTML パースとラッパー <g> が増える
