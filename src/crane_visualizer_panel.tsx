@@ -228,10 +228,13 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   // done() を返すまで Studio は次のフレームを渡さないので、後者が長いほど前者が落ちる。
   const perfRef = useRef({
     frameStartMs: 0,
+    commitEndMs: 0,
     intervals: [] as number[],   // onRender の間隔[ms]
-    durations: [] as number[],   // onRender → done() の所要[ms]
+    durations: [] as number[],   // onRender → React のコミット完了[ms]
+    frames: [] as number[],      // onRender → 次のアニメーションフレーム[ms]（＝ブラウザの描画込み）
     primitives: 0,               // 直近フレームのプリミティブ総数
     visiblePrimitives: 0,        // うち表示中のレイヤーのもの
+    domNodes: 0,                 // SVG 配下の実 DOM ノード数
   });
   // namespaces の最新値。数え上げのために config を effect の依存に入れたくないので ref で持つ
   const namespacesRef = useRef<PanelConfig["namespaces"]>({});
@@ -817,7 +820,15 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
 
   useEffect(() => {
     if (renderDone && perfRef.current.frameStartMs > 0) {
-      pushSample(perfRef.current.durations, performance.now() - perfRef.current.frameStartMs);
+      const commitEndMs = performance.now();
+      perfRef.current.commitEndMs = commitEndMs;
+      pushSample(perfRef.current.durations, commitEndMs - perfRef.current.frameStartMs);
+      perfRef.current.domNodes = svgRef.current?.getElementsByTagName("*").length ?? 0;
+
+      // 次のアニメーションフレームまで＝ブラウザがこのコミットを
+      // レイアウト・描画し終えて戻ってくるまで。React のコミット時間には含まれない
+      const startMs = perfRef.current.frameStartMs;
+      requestAnimationFrame(() => pushSample(perfRef.current.frames, performance.now() - startMs));
     }
     renderDone?.();
   }, [renderDone]);
@@ -855,8 +866,14 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
           <p>History: Aggregated({aggregatedMessagesRef.current.size}), Updates({updateMessagesRef.current.size}), Recompose failures: {recomposeFailureRef.current}</p>
           <p>
             Panel: {(() => { const i = average(perfRef.current.intervals); return i > 0 ? (1000 / i).toFixed(1) : "-"; })()} fps
-            {" / render "}{average(perfRef.current.durations).toFixed(1)} ms
-            {" / primitives "}{perfRef.current.visiblePrimitives} 表示 / {perfRef.current.primitives} 総数
+            {" / interval "}{average(perfRef.current.intervals).toFixed(1)} ms
+            {" = react "}{average(perfRef.current.durations).toFixed(1)}
+            {" + paint "}{Math.max(0, average(perfRef.current.frames) - average(perfRef.current.durations)).toFixed(1)}
+            {" + wait "}{Math.max(0, average(perfRef.current.intervals) - average(perfRef.current.frames)).toFixed(1)} ms
+          </p>
+          <p>
+            primitives {perfRef.current.visiblePrimitives} 表示 / {perfRef.current.primitives} 総数
+            {" / DOM "}{perfRef.current.domNodes} ノード
           </p>
           {seekTime !== undefined && <p>Seek Time: {new Date(seekTime).toISOString()}</p>}
         </div>
