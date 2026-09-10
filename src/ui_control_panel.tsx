@@ -500,11 +500,14 @@ const PANEL_CSS = `
 .rdcp-seg-r { border-radius: 0 3px 3px 0; margin-left: -1px; }
 .rdcp-head { background: none; border: none; }
 .rdcp-head:hover { background: ${colors.surfaceStrong}; }
-/* SSL のチーム色。左端の帯にするのは、角丸長方形とピル型のどちらにも同じ形で乗り、
-   選択中の塗りつぶしの上でも消えないため。
-   色だけに頼らないよう、ボタンの文字（Yellow / Blue）はそのまま残すこと */
+/* SSL のチーム色。選択中の塗りつぶしの上でも消えないよう、輪郭ではなく左端の内側の帯にする。
+   色だけに頼らないよう、ボタンの文字（Yellow / Blue）はそのまま残すこと。
+   ⚠️ 角丸長方形の選択ボタン専用。ピル型（.rdcp-act / .rdcp-danger）に乗せると
+   帯が三日月に潰れ、confirm の赤い二重輪郭とも衝突する。2026-09-10 に一度乗せて戻した */
 .rdcp-b.rdcp-t-yellow { box-shadow: inset 4px 0 0 #e5b91d; }
 .rdcp-b.rdcp-t-blue { box-shadow: inset 4px 0 0 #5aa9e6; }
+.rdcp-act.rdcp-t-yellow, .rdcp-act.rdcp-t-blue,
+.rdcp-danger.rdcp-t-yellow, .rdcp-danger.rdcp-t-blue { box-shadow: none; }
 /* ON/OFF は AI の起動停止のような重い値を持つのに、文字が短いぶん最も小さい的になる。
    幅の下限を置いて、幅を詰めたボタン列と同じくらいの大きさに揃える */
 .rdcp-seg-l, .rdcp-seg-r { min-width: 54px; }
@@ -1021,13 +1024,12 @@ const ServiceButtonRow: React.FC<{
         const busy = pending.has(control.service);
         const isArmed = armed === key;
         const label = control.label.length > 0 ? control.label : control.service;
-        // tones はコントロールが描くボタンに合わせた並びなので、button では先頭の1件
-        const tone = toneClass(control.tones[0]);
-        const style = `${
-          control.confirm
-            ? `rdcp-b rdcp-danger${isArmed ? " rdcp-armed" : ""}`
-            : "rdcp-b rdcp-act"
-        }${tone.length > 0 ? ` ${tone}` : ""}`;
+        // ここではチーム色を塗らない。ラベルに Blue / Yellow と書いてあるので
+        // 色が足す情報がなく、ピル型は角丸 999px なので帯が三日月に潰れる。
+        // confirm 付きは赤い二重輪郭を持つので、色が正面衝突もする
+        const style = control.confirm
+          ? `rdcp-b rdcp-danger${isArmed ? " rdcp-armed" : ""}`
+          : "rdcp-b rdcp-act";
         return (
           <button
             key={key}
