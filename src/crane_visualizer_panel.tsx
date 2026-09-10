@@ -141,6 +141,10 @@ const PanelStats = memo(function PanelStats({ lines }: { lines: string[] }) {
   return <div>{lines.map((line, i) => <p key={i}>{line}</p>)}</div>;
 });
 
+// フォーカスがあるときに SVG の外枠に出す色。
+// ライト・ダークどちらの Studio でも沈まない中間の色にする
+const FOCUS_OUTLINE_COLOR = "#4a9eff";
+
 // シークとみなす巻き戻り量[ms]。
 // ライブ受信でも currentTime と receiveTime は数 ms ずれるので、
 // その揺れをシークと誤判定しないだけの余裕を持たせる。
@@ -267,6 +271,10 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
   const [currentDisplayMsg, setCurrentDisplayMsg] = useState<SvgLayerArray | undefined>();
 
   const [pressedKeys, setPressedKeys] = useState<Set<string>>(new Set());
+  // SVG にフォーカスがあるか。**キーを拾うのはこれが true のときだけ。**
+  // 以前は window に張っていたため、キーボード制御中に他のパネルの入力欄へ
+  // 文字を打つと、それがそのままロボットの操作として解釈されていた
+  const [hasFocus, setHasFocus] = useState(false);
   const panStateRef = useRef<{
     startX: number;
     startY: number;
@@ -471,50 +479,44 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
     return () => clearInterval(interval);
   }, [cleanupHistory]);
 
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      setPressedKeys((prev) => new Set(prev).add(event.key));
-    };
-
-    const handleKeyUp = (event: KeyboardEvent) => {
-      setPressedKeys((prev) => {
-        const next = new Set(prev);
-        next.delete(event.key);
-        return next;
-      });
-    };
-
-    // ショートカットキーによるウィンドウ切り替えなどでウィンドウが非アクティブになったときにキー状態をリセット
-    const handleWindowBlur = () => {
-      setPressedKeys(new Set());
-      // reset mouse refs
-      mouseInfoRef.current = { clientX: 0, clientY: 0, buttons: 0 };
-      mouseStateRef.current = null;
-      panStateRef.current = null;
-    };
-
-    // タブが非表示になったときにキー状態をリセット
-    const handleVisibilityChange = () => {
-      if (document.hidden) {
-        handleWindowBlur();
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("keyup", handleKeyUp);
-    window.addEventListener("blur", handleWindowBlur);
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("keyup", handleKeyUp);
-      window.removeEventListener("blur", handleWindowBlur);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-    };
+  /**
+   * 押下中のキーとマウスの状態を捨てる。
+   *
+   * <p>フォーカスを失ったとき、ウィンドウが非アクティブになったとき、
+   * タブが隠れたときに通す。<b>これを飛ばすと押しっぱなしのキーが残り、
+   * 見ていない画面でロボットが走り続ける。</b>
+   */
+  const resetInputState = useCallback(() => {
+    setPressedKeys(new Set());
+    mouseInfoRef.current = { clientX: 0, clientY: 0, buttons: 0 };
+    mouseStateRef.current = null;
+    panStateRef.current = null;
   }, []);
 
+  // ウィンドウが非アクティブになったとき、タブが隠れたときのリセット。
+  // フォーカスの有無に関わらず張っておく（残っていたものを捨てるだけなので副作用はない）
   useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        resetInputState();
+      }
+    };
+    window.addEventListener("blur", resetInputState);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.removeEventListener("blur", resetInputState);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [resetInputState]);
+
+  /**
+   * 表示のズーム操作。
+   *
+   * <p>SVG にフォーカスがあるときだけ効く。以前は document に張っていたため、
+   * 他のパネルの入力欄で Ctrl+- を押すとこちらの表示が縮んでいた。
+   */
+  const handleZoomShortcut = useCallback(
+    (event: React.KeyboardEvent<SVGSVGElement>) => {
       const isResetShortcut = event.ctrlKey && (event.code === "Digit0" || event.code === "Numpad0");
       const isZoomInShortcut =
         event.ctrlKey &&
@@ -548,14 +550,9 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
           return `${newX} ${newY} ${newWidth} ${newHeight}`;
         });
       }
-    };
-
-    document.addEventListener("keydown", handleKeyDown);
-
-    return () => {
-      document.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [resetViewBox]);
+    },
+    [resetViewBox],
+  );
 
   // 複数トピックのサブスクリプション
   useEffect(() => {
@@ -892,10 +889,40 @@ const CraneVisualizer: React.FC<{ context: PanelExtensionContext }> = ({
           width="100%"
           height="100%"
           viewBox={viewBox}
-          style={{ backgroundColor: config.backgroundColor }}
+          // フォーカスを受け取れるようにする。これが無いとキーイベントが要素に来ない
+          tabIndex={0}
+          style={{
+            backgroundColor: config.backgroundColor,
+            // フォーカスの有無を見て分かるようにする。
+            // キーが効くかどうかがこの枠だけで読める
+            outline: hasFocus ? `2px solid ${FOCUS_OUTLINE_COLOR}` : "2px solid transparent",
+            outlineOffset: -2,
+          }}
+          onFocus={() => {
+            setHasFocus(true);
+          }}
+          onBlur={() => {
+            setHasFocus(false);
+            // 押しっぱなしのキーを残さない。残すと見ていない画面で走り続ける
+            resetInputState();
+          }}
+          onKeyDown={(e) => {
+            handleZoomShortcut(e);
+            setPressedKeys((prev) => new Set(prev).add(e.key));
+          }}
+          onKeyUp={(e) => {
+            setPressedKeys((prev) => {
+              const next = new Set(prev);
+              next.delete(e.key);
+              return next;
+            });
+          }}
           // イベントハンドラは直接メッセージを送るのではなく、refに最新の状態を保存するだけ
           onMouseDown={(e) => {
             e.preventDefault();
+            // preventDefault はフォーカス移動も止めるので、明示的に取りに行く。
+            // クリックした先が操作対象になる、という当たり前の挙動にするため
+            svgRef.current?.focus();
             mouseStateRef.current = "DOWN";
             mouseInfoRef.current = { clientX: e.clientX, clientY: e.clientY, buttons: e.buttons };
 
