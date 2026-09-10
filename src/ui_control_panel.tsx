@@ -51,8 +51,10 @@ interface UiControl {
   rows: string[];
   /** enum_matrix の列見出し。columns と同じ長さ */
   headers: string[];
-  /** ボタンごとのチーム色。並びは choices と同じ（kind="button" は1要素） */
+  /** 選択肢ごとのチーム色。並びは choices と同じ。kind="button" には付けない */
   tones: string[];
+  /** コントロール全体のチーム。id_toggles の「選択中」の塗りをこの色にする */
+  team: string;
   /** 折りたたんだセクション見出しに現在値を出すか */
   summary: boolean;
 }
@@ -136,6 +138,7 @@ function normalizeControl(raw: unknown): UiControl | undefined {
     rows: toStringArray(src["rows"]),
     headers: toStringArray(src["headers"]),
     tones: toStringArray(src["tones"]),
+    team: toStringField(src["team"]),
     summary: src["summary"] === true,
   };
 }
@@ -508,6 +511,22 @@ const PANEL_CSS = `
 .rdcp-b.rdcp-t-blue { box-shadow: inset 4px 0 0 #5aa9e6; }
 .rdcp-act.rdcp-t-yellow, .rdcp-act.rdcp-t-blue,
 .rdcp-danger.rdcp-t-yellow, .rdcp-danger.rdcp-t-blue { box-shadow: none; }
+/* コントロール全体のチーム色。ID の格子は同じ形が2つ縦に並ぶのに、
+   どちらも既定の青で塗られていて、見分ける手掛かりが上の小さなラベルしかなかった。
+   色を足すのではなく「選択中」の塗りを差し替えるので、画面の色の総量は増えない。
+   黄色の上では白文字が読めないので、文字色も一緒に反転させること */
+.rdcp-b.rdcp-sel.rdcp-tm-yellow,
+.rdcp-b.rdcp-sel.rdcp-tm-yellow:hover {
+  background: #e5b91d;
+  border-color: #e5b91d;
+  color: #1a1a1a;
+}
+.rdcp-b.rdcp-sel.rdcp-tm-blue,
+.rdcp-b.rdcp-sel.rdcp-tm-blue:hover {
+  background: ${colors.accent};
+  border-color: ${colors.accent};
+  color: ${colors.accentText};
+}
 /* ON/OFF は AI の起動停止のような重い値を持つのに、文字が短いぶん最も小さい的になる。
    幅の下限を置いて、幅を詰めたボタン列と同じくらいの大きさに揃える */
 .rdcp-seg-l, .rdcp-seg-r { min-width: 54px; }
@@ -571,6 +590,11 @@ function buttonClass(selected: boolean, extra = ""): string {
 /** tones の値をクラス名にする。知らない値には色を付けない（サーバーが値を増やしても壊れない） */
 function toneClass(tone: string | undefined): string {
   return tone === "yellow" || tone === "blue" ? `rdcp-t-${tone}` : "";
+}
+
+/** team の値をクラス名にする。選択中の塗りだけが変わり、色の総量は増えない */
+function teamClass(team: string): string {
+  return team === "yellow" || team === "blue" ? `rdcp-tm-${team}` : "";
 }
 
 /** ボタン列の並べ方。columns が 0 なら折り返しありの1行に詰める */
@@ -925,7 +949,7 @@ const ControlRow: React.FC<ControlProps> = ({
                     key={id}
                     // 現在値が読めないうちは差分を作れないので押させない
                     disabled={busy || active == undefined}
-                    className={buttonClass(selected)}
+                    className={buttonClass(selected, teamClass(control.team))}
                     onClick={() => {
                       send(
                         ids.filter((other) =>
