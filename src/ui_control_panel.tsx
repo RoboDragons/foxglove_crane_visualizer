@@ -47,6 +47,14 @@ interface UiControl {
   max: number;
   /** 押すと取り返しがつかない操作か。立っていたら二段階で実行する */
   confirm: boolean;
+  /** enum_matrix の行見出し。choices は行優先なので i 行 j 列は choices[i * columns + j] */
+  rows: string[];
+  /** enum_matrix の列見出し。columns と同じ長さ */
+  headers: string[];
+  /** ボタンごとのチーム色。並びは choices と同じ（kind="button" は1要素） */
+  tones: string[];
+  /** 折りたたんだセクション見出しに現在値を出すか */
+  summary: boolean;
 }
 
 /** パネルに永続化する状態 */
@@ -125,6 +133,10 @@ function normalizeControl(raw: unknown): UiControl | undefined {
     min: toNumber(src["min"], 0),
     max: toNumber(src["max"], 0),
     confirm: src["confirm"] === true,
+    rows: toStringArray(src["rows"]),
+    headers: toStringArray(src["headers"]),
+    tones: toStringArray(src["tones"]),
+    summary: src["summary"] === true,
   };
 }
 
@@ -351,27 +363,21 @@ const sectionStyle: React.CSSProperties = {
   overflow: "hidden",
 };
 
+// 見出し・ラベル・値で大きさと濃さを変える。
+// 全部が 12px の同じ濃さだと、面の切れ目が区切り線1本ぶんしかなく、
+// 確認が上から順に読む直列作業になる
 const sectionHeaderStyle: React.CSSProperties = {
   alignItems: "center",
   background: colors.surface,
   cursor: "pointer",
   display: "flex",
-  fontWeight: 600,
+  fontSize: 13,
+  fontWeight: 700,
   gap: 6,
-  padding: "6px 8px",
+  letterSpacing: "0.02em",
+  padding: "7px 8px",
   textAlign: "left",
   width: "100%",
-};
-
-const controlRowStyle: React.CSSProperties = {
-  borderTop: `1px solid ${colors.subtleBorder}`,
-  padding: "6px 8px",
-};
-
-const controlLabelStyle: React.CSSProperties = {
-  display: "block",
-  marginBottom: 4,
-  opacity: 0.85,
 };
 
 // select のドロップダウン一覧はページの色を継承しないため、
@@ -494,11 +500,100 @@ const PANEL_CSS = `
 .rdcp-seg-r { border-radius: 0 3px 3px 0; margin-left: -1px; }
 .rdcp-head { background: none; border: none; }
 .rdcp-head:hover { background: ${colors.surfaceStrong}; }
+/* SSL のチーム色。左端の帯にするのは、角丸長方形とピル型のどちらにも同じ形で乗り、
+   選択中の塗りつぶしの上でも消えないため。
+   色だけに頼らないよう、ボタンの文字（Yellow / Blue）はそのまま残すこと */
+.rdcp-b.rdcp-t-yellow { box-shadow: inset 4px 0 0 #e5b91d; }
+.rdcp-b.rdcp-t-blue { box-shadow: inset 4px 0 0 #5aa9e6; }
+/* ON/OFF は AI の起動停止のような重い値を持つのに、文字が短いぶん最も小さい的になる。
+   幅の下限を置いて、幅を詰めたボタン列と同じくらいの大きさに揃える */
+.rdcp-seg-l, .rdcp-seg-r { min-width: 54px; }
+
+/* 行の骨格。
+   ラベルと部品を縦に積むと、短いコントロールでも1件で2行ぶんの高さを取る。
+   横に並べられる kind は rdcp-row-inline にして1行に収める。
+   幅が足りなくなれば flex-wrap が縦積みに戻すので、幅を測る JS は要らない */
+.rdcp-row {
+  border-top: 1px solid ${colors.subtleBorder};
+  padding: 6px 8px;
+}
+.rdcp-row-inline {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 10px;
+}
+.rdcp-row-inline > .rdcp-lb { flex: 0 0 108px; margin-bottom: 0; }
+.rdcp-row-inline > .rdcp-fd { flex: 1 1 150px; max-width: 340px; min-width: 0; }
+/* parameter 名は補足なので、詰めた行でも独立した行に落とす */
+.rdcp-row-inline > .rdcp-pn { flex: 1 0 100%; }
+.rdcp-lb {
+  display: block;
+  font-size: 11px;
+  font-weight: 500;
+  margin-bottom: 4px;
+  opacity: 0.7;
+}
+/* ボタン列は広い画面だと1つあたりが間延びする。押しやすさは 120px 前後で足りる */
+.rdcp-grid { max-width: 520px; }
+/* 表の列見出しと行見出し。押せないことが分かるよう、文字だけにして濃さを落とす */
+.rdcp-th {
+  font-size: 11px;
+  opacity: 0.7;
+  overflow: hidden;
+  padding: 2px 4px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rdcp-th-col { text-align: center; }
+/* 折りたたんでも状態が読めるようにする要約。セクション名より弱く出す */
+.rdcp-sum {
+  color: ${colors.muted};
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: normal;
+  margin-left: auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 `;
 
 /** 選択できるボタンのクラス名 */
 function buttonClass(selected: boolean, extra = ""): string {
   return `rdcp-b${selected ? " rdcp-sel" : ""}${extra.length > 0 ? ` ${extra}` : ""}`;
+}
+
+/** tones の値をクラス名にする。知らない値には色を付けない（サーバーが値を増やしても壊れない） */
+function toneClass(tone: string | undefined): string {
+  return tone === "yellow" || tone === "blue" ? `rdcp-t-${tone}` : "";
+}
+
+/** ボタン列の並べ方。columns が 0 なら折り返しありの1行に詰める */
+function gridStyle(columns: number): React.CSSProperties {
+  return columns > 0
+    ? {
+        display: "grid",
+        gap: 4,
+        gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
+      }
+    : { display: "flex", flexWrap: "wrap", gap: 4 };
+}
+
+/** ラベルと部品を1行に並べられる kind か。選択肢が多いものは横に収まらない */
+function isInlineKind(control: UiControl): boolean {
+  switch (control.kind) {
+    case "bool":
+    case "enum":
+    case "int_range":
+    case "number":
+      return true;
+    case "enum_services":
+      return control.choices.length <= 3;
+    default:
+      return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -572,23 +667,16 @@ const ControlRow: React.FC<ControlProps> = ({
       }
 
       case "enum_buttons": {
-        const layout: React.CSSProperties =
-          control.columns > 0
-            ? {
-                display: "grid",
-                gap: 4,
-                gridTemplateColumns: `repeat(${control.columns}, minmax(0, 1fr))`,
-              }
-            : { display: "flex", flexWrap: "wrap", gap: 4 };
+        const layout = gridStyle(control.columns);
         return (
-          <div style={layout}>
+          <div className="rdcp-grid" style={layout}>
             {control.choices.map((choice, index) => {
               const selected = current != undefined && current === choice;
               return (
                 <button
                   key={`${choice}-${index}`}
                   title={choice}
-                  className={buttonClass(selected)}
+                  className={buttonClass(selected, toneClass(control.tones[index]))}
                   onClick={() => {
                     onSetParameter(control.parameter, choice);
                   }}
@@ -597,6 +685,68 @@ const ControlRow: React.FC<ControlProps> = ({
                 </button>
               );
             })}
+          </div>
+        );
+      }
+
+      case "enum_matrix": {
+        // 同じ2択を縦に6組並べると、見出し行とボタン行で12行を使い、
+        // しかも並ぶ文字は Yellow と Blue の2種類しかないので、
+        // どの行を見ているのかがラベルを読み直すまで分からない。
+        // 行見出しを左端の列に出す表にすれば、列がチーム・行がコマンドと形で読める。
+        //
+        // 列数は headers ではなく columns を正とする。両者がずれていても
+        // 描画は成立してしまうので、足りないセルは空にして気づけるようにする
+        const cols = control.columns > 0 ? control.columns : control.headers.length;
+        if (cols <= 0 || control.rows.length === 0) {
+          return (
+            <div style={{ color: colors.error }}>
+              enum_matrix に rows か columns がありません
+            </div>
+          );
+        }
+        return (
+          <div
+            className="rdcp-grid"
+            style={{
+              display: "grid",
+              gap: 4,
+              gridTemplateColumns: `minmax(72px, auto) repeat(${cols}, minmax(0, 1fr))`,
+            }}
+          >
+            <span />
+            {Array.from({ length: cols }, (_, col) => (
+              <span key={`h-${col}`} className="rdcp-th rdcp-th-col">
+                {control.headers[col] ?? ""}
+              </span>
+            ))}
+            {control.rows.map((rowLabel, row) => (
+              <React.Fragment key={`r-${row}`}>
+                <span className="rdcp-th" title={rowLabel}>
+                  {rowLabel}
+                </span>
+                {Array.from({ length: cols }, (_, col) => {
+                  const index = row * cols + col;
+                  const choice = control.choices[index];
+                  if (choice == undefined) {
+                    return <span key={`c-${col}`} />;
+                  }
+                  const selected = current != undefined && current === choice;
+                  return (
+                    <button
+                      key={`c-${col}`}
+                      title={choice}
+                      className={buttonClass(selected, toneClass(control.tones[index]))}
+                      onClick={() => {
+                        onSetParameter(control.parameter, choice);
+                      }}
+                    >
+                      {control.headers[col] ?? displayLabel(control, index)}
+                    </button>
+                  );
+                })}
+              </React.Fragment>
+            ))}
           </div>
         );
       }
@@ -712,16 +862,9 @@ const ControlRow: React.FC<ControlProps> = ({
         // 見た目は enum_buttons と同じ。違うのは書き込みが parameter ではなく
         // service で、選択肢ごとに呼ぶ先が違うところだけ
         const table = readChoiceServices(control.payload);
-        const layout: React.CSSProperties =
-          control.columns > 0
-            ? {
-                display: "grid",
-                gap: 4,
-                gridTemplateColumns: `repeat(${control.columns}, minmax(0, 1fr))`,
-              }
-            : { display: "flex", flexWrap: "wrap", gap: 4 };
+        const layout = gridStyle(control.columns);
         return (
-          <div style={layout}>
+          <div className="rdcp-grid" style={layout}>
             {control.choices.map((choice, index) => {
               const target = table.get(choice);
               const selected = current != undefined && current === choice;
@@ -732,7 +875,7 @@ const ControlRow: React.FC<ControlProps> = ({
                   // 押せてしまうと「押したのに変わらない」と読めてしまう
                   disabled={target == undefined || pending.has(target.service)}
                   title={target == undefined ? choice : `${choice} → ${target.service}`}
-                  className={buttonClass(selected)}
+                  className={buttonClass(selected, toneClass(control.tones[index]))}
                   onClick={() => {
                     if (target == undefined) {
                       return;
@@ -768,17 +911,10 @@ const ControlRow: React.FC<ControlProps> = ({
         const send = (next: number[]) => {
           onCallService(control.service, payloadWithIds(control.payload, next));
         };
-        const layout: React.CSSProperties =
-          control.columns > 0
-            ? {
-                display: "grid",
-                gap: 4,
-                gridTemplateColumns: `repeat(${control.columns}, minmax(0, 1fr))`,
-              }
-            : { display: "flex", flexWrap: "wrap", gap: 4 };
+        const layout = gridStyle(control.columns);
         return (
           <div>
-            <div style={layout}>
+            <div className="rdcp-grid" style={layout}>
               {ids.map((id) => {
                 const selected = active?.has(id) ?? false;
                 return (
@@ -835,13 +971,16 @@ const ControlRow: React.FC<ControlProps> = ({
   })();
 
   const showHeading = control.label.length > 0;
+  const inline = isInlineKind(control);
 
   return (
-    <div style={controlRowStyle}>
-      {showHeading && <span style={controlLabelStyle}>{control.label}</span>}
-      {body}
+    <div className={`rdcp-row${inline ? " rdcp-row-inline" : ""}`}>
+      {showHeading && <span className="rdcp-lb">{control.label}</span>}
+      <div className="rdcp-fd">{body}</div>
       {showParameterName && control.parameter.length > 0 && (
-        <div style={{ color: colors.muted, fontSize: 10, marginTop: 3 }}>{control.parameter}</div>
+        <div className="rdcp-pn" style={{ color: colors.muted, fontSize: 10, marginTop: 3 }}>
+          {control.parameter}
+        </div>
       )}
     </div>
   );
@@ -876,15 +1015,19 @@ const ServiceButtonRow: React.FC<{
   }, [armed]);
 
   return (
-    <div style={{ ...controlRowStyle, display: "flex", flexWrap: "wrap", gap: 4 }}>
+    <div className="rdcp-row" style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
       {controls.map((control, index) => {
         const key = `${control.service}-${index}`;
         const busy = pending.has(control.service);
         const isArmed = armed === key;
         const label = control.label.length > 0 ? control.label : control.service;
-        const style = control.confirm
-          ? `rdcp-b rdcp-danger${isArmed ? " rdcp-armed" : ""}`
-          : "rdcp-b rdcp-act";
+        // tones はコントロールが描くボタンに合わせた並びなので、button では先頭の1件
+        const tone = toneClass(control.tones[0]);
+        const style = `${
+          control.confirm
+            ? `rdcp-b rdcp-danger${isArmed ? " rdcp-armed" : ""}`
+            : "rdcp-b rdcp-act"
+        }${tone.length > 0 ? ` ${tone}` : ""}`;
         return (
           <button
             key={key}
@@ -932,6 +1075,37 @@ function packRows(controls: UiControl[]): Row[] {
     }
   }
   return rows;
+}
+
+/**
+ * 折りたたんだセクション見出しに出す現在値。読めないときは undefined。
+ *
+ * <p>試合前の最終確認は、値が全部同じ見た目で並んでいると上から順に読む直列作業になる。
+ * セクション単位で状態が読めれば、確認は畳んだままの走査で済む。
+ *
+ * <p>bool と id_toggles はラベルが無いと何の値か分からないので添える。
+ * 選択肢を持つものは値そのものが名前になっているので、値だけ出す。
+ */
+function summaryText(control: UiControl, value: Immutable<ParameterValue>): string | undefined {
+  if (value == undefined) {
+    return undefined;
+  }
+  switch (control.kind) {
+    case "bool":
+      return `${control.label} ${isTruthyParameter(value) ? "ON" : "OFF"}`;
+    case "id_toggles": {
+      const active = toIdSet(value);
+      return active == undefined ? undefined : `${control.label} ${active.size}`;
+    }
+    default: {
+      const current = valueToComparable(value);
+      if (current == undefined) {
+        return undefined;
+      }
+      const index = control.choices.indexOf(current);
+      return index >= 0 ? displayLabel(control, index) : current;
+    }
+  }
 }
 
 /** サービスの応答をステータス行に出せる長さに畳む */
@@ -1325,6 +1499,12 @@ const UiControlPanel: React.FC<{ context: PanelExtensionContext }> = ({ context 
 
       {groups.map((group) => {
         const collapsed = state.collapsed[group.name] ?? false;
+        // 件数はどの場面でも使わない情報なので、代わりにそのセクションの現在値を出す
+        const summary = group.controls
+          .filter((control) => control.summary && control.parameter.length > 0)
+          .map((control) => summaryText(control, parameters?.get(control.parameter)))
+          .filter((text): text is string => text != undefined)
+          .join(" · ");
         return (
           <div key={group.name} style={sectionStyle}>
             <button
@@ -1335,10 +1515,12 @@ const UiControlPanel: React.FC<{ context: PanelExtensionContext }> = ({ context 
               }}
             >
               <span style={{ width: 10 }}>{collapsed ? "▸" : "▾"}</span>
-              <span>{group.name}</span>
-              <span style={{ color: colors.muted, fontWeight: 400, marginLeft: "auto" }}>
-                {group.controls.length}
-              </span>
+              <span style={{ flex: "none" }}>{group.name}</span>
+              {summary.length > 0 && (
+                <span className="rdcp-sum" title={summary}>
+                  {summary}
+                </span>
+              )}
             </button>
             {!collapsed &&
               packRows(group.controls).map((row, index) =>
