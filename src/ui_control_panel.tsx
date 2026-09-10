@@ -31,6 +31,8 @@ const CONFIRM_TIMEOUT_MS = 4000;
 const STATUS_FADE_MS = 6000;
 // ステータス行の最大件数。連打したときに何件目の応答かが分かればよい
 const MAX_STATUS_ROWS = 3;
+// id_toggles の None を構えているかどうかの識別子。1つのコントロールに1つしかない
+const NONE_KEY = "none";
 
 /** foxglove.UiControl に対応する型。proto3 のデフォルト値を埋めた正規化済みの形 */
 interface UiControl {
@@ -638,6 +640,36 @@ interface ControlProps {
   onCallService: (service: string, payload: string) => void;
 }
 
+/**
+ * confirm 付きボタンの「構えた」状態。一定時間で自動的に元へ戻る。
+ *
+ * <p>ダイアログを出さないのは、モーダルを閉じる操作がもう1つ増えるうえ、
+ * 押した場所から目線が飛ぶため。時間は短すぎると読む前に戻り、
+ * 長すぎると次の操作のつもりの1クリックで実行してしまう。
+ *
+ * <p>戻り値の識別子は「どのボタンを構えているか」。同時に構えられるのは1つだけ。
+ */
+function useArmed(): [
+  string | undefined,
+  React.Dispatch<React.SetStateAction<string | undefined>>,
+] {
+  const [armed, setArmed] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    if (armed == undefined) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      setArmed(undefined);
+    }, CONFIRM_TIMEOUT_MS);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [armed]);
+
+  return [armed, setArmed];
+}
+
 const ControlRow: React.FC<ControlProps> = ({
   control,
   isDark,
@@ -649,6 +681,8 @@ const ControlRow: React.FC<ControlProps> = ({
 }) => {
   // 数値入力は編集途中の文字列をローカルに持つ（"1." のような中間状態を許すため）
   const [draft, setDraft] = useState<string | undefined>(undefined);
+  // id_toggles の None 用。フックなので kind の分岐の中では呼べず、ここで持つ
+  const [armed, setArmed] = useArmed();
 
   const current = valueToComparable(currentValue);
 
@@ -973,14 +1007,30 @@ const ControlRow: React.FC<ControlProps> = ({
               >
                 All
               </button>
+              {/* この格子で取り返しがつかないのは None だけ。
+                  試合前の準備を1クリックで消せてしまうので、confirm が立っていたら構えさせる。
+                  全台有効化は個別に選び直せば戻るので All には掛けない */}
               <button
-                className="rdcp-b rdcp-act"
+                className={`rdcp-b ${
+                  control.confirm
+                    ? `rdcp-danger${armed === NONE_KEY ? " rdcp-armed" : ""}`
+                    : "rdcp-act"
+                }`}
                 disabled={busy}
                 onClick={() => {
+                  if (!control.confirm) {
+                    send([]);
+                    return;
+                  }
+                  if (armed !== NONE_KEY) {
+                    setArmed(NONE_KEY);
+                    return;
+                  }
+                  setArmed(undefined);
                   send([]);
                 }}
               >
-                None
+                {control.confirm && armed === NONE_KEY ? "None?" : "None"}
               </button>
             </div>
           </div>
@@ -1024,22 +1074,7 @@ const ServiceButtonRow: React.FC<{
   pending: ReadonlySet<string>;
   onCallService: (service: string, payload: string) => void;
 }> = ({ controls, pending, onCallService }) => {
-  // confirm 付きボタンのうち、いま構えているもの。一定時間で自動的に戻す。
-  // ダイアログを出さないのは、モーダルを閉じる操作がもう1つ増えるうえ、
-  // 押した場所から目線が飛ぶため
-  const [armed, setArmed] = useState<string | undefined>(undefined);
-
-  useEffect(() => {
-    if (armed == undefined) {
-      return;
-    }
-    const timer = setTimeout(() => {
-      setArmed(undefined);
-    }, CONFIRM_TIMEOUT_MS);
-    return () => {
-      clearTimeout(timer);
-    };
-  }, [armed]);
+  const [armed, setArmed] = useArmed();
 
   return (
     <div className="rdcp-row" style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
