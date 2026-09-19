@@ -94,7 +94,6 @@ function usePanelSettings(
 const ConfigPanel: React.FC<{ context: PanelExtensionContext }> = ({ context }) => {
   const [state, setState] = useState<PanelState>(defaultState);
   const [query, setQuery] = useState("");
-  const [showFileOps, setShowFileOps] = useState(false);
 
   const isDark = useIsDarkTheme(context.panelElement);
   const { nodes, parameters, serverStatus } = useConfigStream(context, state.topic);
@@ -185,7 +184,6 @@ const ConfigPanel: React.FC<{ context: PanelExtensionContext }> = ({ context }) 
     >
       <style>{TABLE_CSS + FILE_OPS_CSS}</style>
 
-      {/* 常時出すのは絞り込みだけ。ファイル操作は設定ファイル名のボタンで開閉する */}
       <div style={{ alignItems: "center", display: "flex", gap: 6, marginBottom: 6 }}>
         <input
           type="text"
@@ -199,16 +197,6 @@ const ConfigPanel: React.FC<{ context: PanelExtensionContext }> = ({ context }) 
         <span style={{ opacity: 0.7, whiteSpace: "nowrap" }}>
           {query.trim().length > 0 ? `${countLeaves(visible)} / ${total}` : `${total}`}
         </span>
-        <button
-          className="rdccfg-btn"
-          title="ファイル操作"
-          onClick={() => {
-            setShowFileOps((prev) => !prev);
-          }}
-        >
-          {serverStatus?.configName ?? "?"}
-          {serverStatus?.dirty === true ? " *" : ""}
-        </button>
       </div>
 
       {!writable && (
@@ -217,16 +205,19 @@ const ConfigPanel: React.FC<{ context: PanelExtensionContext }> = ({ context }) 
         </div>
       )}
 
-      {showFileOps && (
-        <FileOps
-          files={files}
-          writable={writable}
-          isDark={isDark}
-          callService={callService}
-          pushStatus={pushStatus}
-          onFilesChanged={refreshFiles}
-        />
-      )}
+      {/* ファイル操作は常に出す。一時期は設定ファイル名のボタンの奥に畳んでいたが、
+          名前だけのボタンからは「押すと保存や読み込みが出る」ことが読み取れなかった。
+          1行増えても、何ができるかが見えているほうがよい */}
+      <FileOps
+        configName={serverStatus?.configName}
+        dirty={serverStatus?.dirty === true}
+        files={files}
+        writable={writable}
+        isDark={isDark}
+        callService={callService}
+        pushStatus={pushStatus}
+        onFilesChanged={refreshFiles}
+      />
 
       {statuses.length > 0 && (
         <div style={{ marginBottom: 6 }}>

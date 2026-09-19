@@ -1,8 +1,8 @@
 /**
  * 設定ファイルの操作。保存・別名保存・読み込み・再起動。
  *
- * <p>本文より使う頻度がずっと低いので、普段は畳んでおき、
- * パネル上部の設定ファイル名のボタンで開く。
+ * <p>先頭に開いているファイル名と未保存の印を出し、その右に操作を並べる。
+ * 「どのファイルに対する操作か」が同じ行で読めるようにするため。
  */
 
 import * as React from "react";
@@ -39,13 +39,17 @@ function fieldStyle(isDark: boolean): React.CSSProperties {
 }
 
 export const FileOps: React.FC<{
+  /** 開いている設定ファイル名。まだ届いていなければ undefined */
+  configName: string | undefined;
+  /** 未保存の変更があるか */
+  dirty: boolean;
   files: string[];
   writable: boolean;
   isDark: boolean;
   callService: CallService;
   pushStatus: (kind: StatusKind, text: string) => void;
   onFilesChanged: () => void;
-}> = ({ files, writable, isDark, callService, pushStatus, onFilesChanged }) => {
+}> = ({ configName, dirty, files, writable, isDark, callService, pushStatus, onFilesChanged }) => {
   const [saveAsName, setSaveAsName] = useState("");
   // "restart" か "load:<ファイル名>"。構えている確認を1つだけ持つ
   const [confirming, setConfirming] = useState<string | undefined>();
@@ -81,16 +85,12 @@ export const FileOps: React.FC<{
 
   return (
     <div
-      style={{
-        border: `1px solid ${colors.subtleBorder}`,
-        borderRadius: 4,
-        display: "flex",
-        flexWrap: "wrap",
-        gap: 6,
-        marginBottom: 6,
-        padding: 6,
-      }}
+      style={{ alignItems: "center", display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}
     >
+      <span style={{ fontWeight: 600, whiteSpace: "nowrap" }}>
+        {configName ?? "?"}
+        {dirty && <span title="未保存の変更があります"> *</span>}
+      </span>
       <button
         className="rdccfg-btn"
         disabled={!writable}
