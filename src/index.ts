@@ -1,5 +1,6 @@
 import { ExtensionContext } from "@foxglove/studio";
 import { initPanel } from "./crane_visualizer_panel";
+import { initConfigPanel } from "./config_panel";
 import { initUiControlPanel } from "./ui_control_panel";
 
 export function activate(extensionContext: ExtensionContext): void {
@@ -7,5 +8,9 @@ export function activate(extensionContext: ExtensionContext): void {
   extensionContext.registerPanel({
     name: "crane-control-panel",
     initPanel: initUiControlPanel,
+  });
+  extensionContext.registerPanel({
+    name: "crane-config-panel",
+    initPanel: initConfigPanel,
   });
 }
