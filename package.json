@@ -23,7 +23,8 @@
     "foxglove:dev": "foxglove-extension build",
     "foxglove:package": "foxglove-extension package",
     "prepare": "npm run clean && npm run build",
-    "local-install": "foxglove-extension install"
+    "local-install": "foxglove-extension install",
+    "check": "rimraf .check && tsc src/namespace_tree.ts src/namespace_tree.check.ts src/config_tree.ts src/config_tree.check.ts --outDir .check --module commonjs --target es2020 --strict && node .check/namespace_tree.check.js && node .check/config_tree.check.js"
   },
   "dependencies": {
     "react": "^17.0.2",
