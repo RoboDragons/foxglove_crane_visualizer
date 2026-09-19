@@ -24,7 +24,7 @@ import * as React from "react";
 import { StrictMode, useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import ReactDOM from "react-dom";
 
-import { FILE_OPS_CSS, FileOps } from "./config_file_ops";
+import { FIELD_ICON_INSET, FILE_OPS_CSS, FileOps, IconField } from "./config_file_ops";
 import {
   useConfigFiles,
   useConfigStream,
@@ -185,15 +185,17 @@ const ConfigPanel: React.FC<{ context: PanelExtensionContext }> = ({ context }) 
       <style>{TABLE_CSS + FILE_OPS_CSS}</style>
 
       <div style={{ alignItems: "center", display: "flex", gap: 6, marginBottom: 6 }}>
-        <input
-          type="text"
-          placeholder="名前で絞り込む"
-          style={{ ...inputStyle(isDark), flex: "1 1 auto", padding: "2px 6px", width: "auto" }}
-          value={query}
-          onChange={(e) => {
-            setQuery(e.target.value);
-          }}
-        />
+        <IconField icon="search" style={{ flex: "1 1 auto" }}>
+          <input
+            type="text"
+            placeholder="名前で絞り込む"
+            style={{ ...inputStyle(isDark), padding: `2px 6px 2px ${FIELD_ICON_INSET}px` }}
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value);
+            }}
+          />
+        </IconField>
         <span style={{ opacity: 0.7, whiteSpace: "nowrap" }}>
           {query.trim().length > 0 ? `${countLeaves(visible)} / ${total}` : `${total}`}
         </span>

@@ -19,6 +19,7 @@ import {
   useState,
 } from "react";
 import ReactDOM from "react-dom";
+import { Chevron, Icon } from "./icons";
 import { colors, inputColors, inputStyle, optionStyle, useIsDarkTheme } from "./panel_theme";
 
 const DEFAULT_TOPIC = "/ui_layout";
@@ -60,6 +61,10 @@ interface UiControl {
   team: string;
   /** 折りたたんだセクション見出しに現在値を出すか */
   summary: boolean;
+  /** ボタンごとのアイコン名。並びは tones と同じ。空文字はアイコンなし */
+  icons: string[];
+  /** セクション見出しのアイコン名。同じ group の中で最初に空でない値を使う */
+  groupIcon: string;
 }
 
 /** パネルに永続化する状態 */
@@ -143,6 +148,9 @@ function normalizeControl(raw: unknown): UiControl | undefined {
     tones: toStringArray(src["tones"]),
     team: toStringField(src["team"]),
     summary: src["summary"] === true,
+    icons: toStringArray(src["icons"]),
+    // 復号器によってスネークケースのまま届くことがあるので両方読む（config_tree.ts と同じ）
+    groupIcon: toStringField(src["groupIcon"] ?? src["group_icon"]),
   };
 }
 
@@ -453,6 +461,16 @@ const PANEL_CSS = `
   white-space: nowrap;
 }
 .rdcp-th-col { text-align: center; }
+/* アイコン付きのボタンの中身。ボタン自身を flex にすると text-overflow が効かなくなるので、
+   中に1段挟んで文字の側で省略する */
+.rdcp-bc {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+  justify-content: center;
+  min-width: 0;
+}
+.rdcp-bt { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 /* 折りたたんでも状態が読めるようにする要約。セクション名より弱く出す */
 .rdcp-sum {
   color: ${colors.muted};
@@ -480,6 +498,24 @@ function toneClass(tone: string | undefined): string {
 /** team の値をクラス名にする。選択中の塗りだけが変わり、色の総量は増えない */
 function teamClass(team: string): string {
   return team === "yellow" || team === "blue" ? `rdcp-tm-${team}` : "";
+}
+
+/**
+ * ボタンの中身。アイコンがあれば文字の左に付ける。
+ *
+ * <p>アイコンは文字の代わりではなく横に添えるだけ（docs/foxglove/icon-plan.md）。
+ * アイコンが無いときは今までどおり文字だけを返し、見た目を変えない。
+ */
+function buttonContent(icon: string | undefined, label: React.ReactNode): React.ReactNode {
+  if (icon == undefined || icon.length === 0) {
+    return label;
+  }
+  return (
+    <span className="rdcp-bc">
+      <Icon name={icon} />
+      <span className="rdcp-bt">{label}</span>
+    </span>
+  );
 }
 
 /** ボタン列の並べ方。columns が 0 なら折り返しありの1行に詰める */
@@ -625,7 +661,7 @@ const ControlRow: React.FC<ControlProps> = ({
                     onSetParameter(control.parameter, choice);
                   }}
                 >
-                  {displayLabel(control, index)}
+                  {buttonContent(control.icons[index], displayLabel(control, index))}
                 </button>
               );
             })}
@@ -827,7 +863,7 @@ const ControlRow: React.FC<ControlProps> = ({
                     onCallService(target.service, JSON.stringify(target.request ?? {}));
                   }}
                 >
-                  {displayLabel(control, index)}
+                  {buttonContent(control.icons[index], displayLabel(control, index))}
                 </button>
               );
             })}
@@ -991,13 +1027,19 @@ const ServiceButtonRow: React.FC<{
               onCallService(control.service, control.payload);
             }}
           >
-            {isArmed ? `${label}?` : label}
+            {/* 構えている間は文字だけが確認の文言に変わり、アイコンは残す */}
+            {buttonContent(control.icons[0], isArmed ? `${label}?` : label)}
           </button>
         );
       })}
     </div>
   );
 };
+
+/** セクション見出しのアイコン名。group の中で最初に空でない group_icon を使う */
+function groupIcon(controls: readonly UiControl[]): string {
+  return controls.find((control) => control.groupIcon.length > 0)?.groupIcon ?? "";
+}
 
 /** group 内のコントロールを描画単位に分ける。連続する button は1行にまとめる */
 type Row =
@@ -1458,7 +1500,10 @@ const UiControlPanel: React.FC<{ context: PanelExtensionContext }> = ({ context 
                 toggleGroup(group.name);
               }}
             >
-              <span style={{ width: 10 }}>{collapsed ? "▸" : "▾"}</span>
+              <span style={{ display: "flex", opacity: 0.7 }}>
+                <Chevron open={!collapsed} />
+              </span>
+              <Icon name={groupIcon(group.controls)} size={16} />
               <span style={{ flex: "none" }}>{group.name}</span>
               {summary.length > 0 && (
                 <span className="rdcp-sum" title={summary}>

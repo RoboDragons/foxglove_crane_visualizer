@@ -26,6 +26,7 @@ import {
   parseArray,
   parseValue,
 } from "./config_tree";
+import { Chevron, Icon } from "./icons";
 import { colors, inputColors, optionStyle } from "./panel_theme";
 
 /**
@@ -37,6 +38,26 @@ import { colors, inputColors, optionStyle } from "./panel_theme";
 const ROW_HEIGHT = 20;
 /** 1段ぶんの字下げ[px]。接続線はこの幅の中央に引く */
 const INDENT_PX = 14;
+/** 枝・葉の頭に付けるアイコンの大きさ[px] */
+const NODE_ICON_PX = 14;
+/** 頭のアイコンと名前の間[px] */
+const NODE_ICON_GAP = 4;
+
+/**
+ * 葉の頭の書類アイコン。
+ *
+ * <p>Swing の木と同じくフォルダ（枝）と書類（葉）で見分けられるようにする。
+ * 葉は約 200 行あるので薄くして、名前より目立たせない。
+ * 🔴 props に依存しない定数の要素にしておくこと。LeafRow の memo を壊さないため
+ */
+const LEAF_ICON = (
+  <Icon
+    name="description"
+    size={NODE_ICON_PX}
+    style={{ marginRight: NODE_ICON_GAP, opacity: 0.45 }}
+  />
+);
+
 /** 値のセルの左右の余白[px]。表示と編集で文字の位置をずらさないために共有する */
 const CELL_PADDING_X = 6;
 /** 名前の列の幅の下限と上限[px]。ドラッグで潰したり広げすぎたりしないため */
@@ -367,8 +388,9 @@ const LeafRow: React.FC<{
   <div className="rdccfg-row" style={rowStyle(props.nameWidth)}>
     <div style={nameCellStyle} title={props.node.path}>
       <Indent depth={props.depth} />
-      {/* 枝の矢印と頭を揃えるための空き */}
-      <span style={{ flex: "0 0 auto", width: 14 }} />
+      {/* 枝の山形と頭を揃えるための空き */}
+      <span style={{ flex: "0 0 auto", width: INDENT_PX }} />
+      {LEAF_ICON}
       <span style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
         {props.showPath ? props.node.path : props.node.label}
       </span>
@@ -387,7 +409,7 @@ const LeafRow: React.FC<{
 ));
 LeafRow.displayName = "LeafRow";
 
-/** 枝の行。値の列は空ける（Swing と同じ） */
+/** 枝の行。値の列は空ける（Swing と同じ）。頭に山形とフォルダを出す */
 const GroupRow: React.FC<{
   label: string;
   depth: number;
@@ -402,9 +424,22 @@ const GroupRow: React.FC<{
   >
     <div style={nameCellStyle}>
       <Indent depth={depth} />
-      <span style={{ flex: "0 0 auto", opacity: 0.7, textAlign: "center", width: 14 }}>
-        {open ? "▾" : "▸"}
+      <span
+        style={{
+          display: "flex",
+          flex: "0 0 auto",
+          justifyContent: "center",
+          opacity: 0.7,
+          width: INDENT_PX,
+        }}
+      >
+        <Chevron open={open} size={INDENT_PX} />
       </span>
+      <Icon
+        name={open ? "folder_open" : "folder"}
+        size={NODE_ICON_PX}
+        style={{ marginRight: NODE_ICON_GAP, opacity: 0.8 }}
+      />
       <span style={{ fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis" }}>
         {label}
       </span>

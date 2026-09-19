@@ -9,6 +9,7 @@ import * as React from "react";
 import { useEffect, useState } from "react";
 
 import { CallService, StatusKind, isFailure } from "./config_hooks";
+import { Icon } from "./icons";
 import { colors, inputStyle, optionStyle } from "./panel_theme";
 
 const SVC_SAVE = "/config/save";
@@ -21,6 +22,9 @@ const CONFIRM_TIMEOUT_MS = 4000;
 
 export const FILE_OPS_CSS = `
 .rdccfg-btn {
+  align-items: center;
+  display: inline-flex;
+  gap: 4px;
   font: inherit;
   color: inherit;
   cursor: pointer;
@@ -32,10 +36,37 @@ export const FILE_OPS_CSS = `
 .rdccfg-btn:hover:not(:disabled) { background: ${colors.surface}; }
 .rdccfg-btn:disabled { cursor: default; opacity: 0.5; }
 .rdccfg-btn.danger { border-color: ${colors.danger}; color: ${colors.danger}; }
+.rdccfg-field { align-items: center; display: flex; position: relative; }
+.rdccfg-field > svg { left: 6px; opacity: 0.7; pointer-events: none; position: absolute; }
 `;
+
+/** 入力欄の左端に置くアイコンのぶんの字下げ[px] */
+export const FIELD_ICON_INSET = 24;
+
+/**
+ * 入力欄・ドロップダウンの左端にアイコンを重ねる。
+ *
+ * <p>select の中身（option）にはアイコンを入れられないので、外から重ねて
+ * 入力欄の側に左の余白を足す。子の style に {@link FIELD_ICON_INSET} を足すこと。
+ */
+export const IconField: React.FC<{ icon: string; style?: React.CSSProperties }> = ({
+  icon,
+  style,
+  children,
+}) => (
+  <span className="rdccfg-field" style={style}>
+    <Icon name={icon} />
+    {children}
+  </span>
+);
 
 function fieldStyle(isDark: boolean): React.CSSProperties {
   return { ...inputStyle(isDark), flex: "1 1 120px", padding: "2px 6px", width: "auto" };
+}
+
+/** IconField の中に入れるドロップダウン。幅は IconField の側で決める */
+function iconFieldStyle(isDark: boolean): React.CSSProperties {
+  return { ...inputStyle(isDark), padding: `2px 6px 2px ${FIELD_ICON_INSET}px` };
 }
 
 export const FileOps: React.FC<{
@@ -98,6 +129,7 @@ export const FileOps: React.FC<{
           callService(SVC_SAVE, {}, onFilesChanged);
         }}
       >
+        <Icon name="save" />
         保存
       </button>
       <input
@@ -120,27 +152,30 @@ export const FileOps: React.FC<{
           });
         }}
       >
+        <Icon name="save_as" />
         別名で保存
       </button>
-      <select
-        style={fieldStyle(isDark)}
-        disabled={!writable}
-        value=""
-        onChange={(e) => {
-          if (e.target.value.length > 0) {
-            load(e.target.value);
-          }
-        }}
-      >
-        <option style={optionStyle(isDark)} value="">
-          {confirming?.startsWith("load:") === true ? "破棄して読み込む…" : "読み込む…"}
-        </option>
-        {files.map((file) => (
-          <option key={file} style={optionStyle(isDark)} value={file}>
-            {file}
+      <IconField icon="file_open" style={{ flex: "1 1 120px" }}>
+        <select
+          style={iconFieldStyle(isDark)}
+          disabled={!writable}
+          value=""
+          onChange={(e) => {
+            if (e.target.value.length > 0) {
+              load(e.target.value);
+            }
+          }}
+        >
+          <option style={optionStyle(isDark)} value="">
+            {confirming?.startsWith("load:") === true ? "破棄して読み込む…" : "読み込む…"}
           </option>
-        ))}
-      </select>
+          {files.map((file) => (
+            <option key={file} style={optionStyle(isDark)} value={file}>
+              {file}
+            </option>
+          ))}
+        </select>
+      </IconField>
       {/* 押す頻度は保存よりずっと低い。構えるまでは他のボタンと同じ見た目にして、
           確認待ちのときだけ赤くする */}
       <button
@@ -155,6 +190,7 @@ export const FileOps: React.FC<{
           }
         }}
       >
+        <Icon name="restart_alt" />
         {confirming === "restart" ? "本当に再起動する？（接続が切れます）" : "再起動して反映"}
       </button>
     </div>
