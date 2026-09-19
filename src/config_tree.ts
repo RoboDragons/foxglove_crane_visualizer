@@ -212,17 +212,6 @@ export function filterTree(items: readonly TreeItem[], query: string): TreeItem[
   return result;
 }
 
-/**
- * 既定で開いておく枝のパス。
- *
- * <p><b>どこも開かない。</b> 1段目を開くと、枝とその配下の葉が入り混じって
- * 縦に伸び、ルートに何があるかが読み取れなくなる。
- * 畳んでおけば最初の画面が「章立て」になる。
- */
-export function defaultExpanded(_items: readonly TreeItem[]): string[] {
-  return [];
-}
-
 /** 木に含まれる枝のパスをすべて集める。「すべて開く」に使う */
 export function allGroupPaths(items: readonly TreeItem[]): string[] {
   const paths: string[] = [];
@@ -333,9 +322,42 @@ export function parseValue(kind: ConfigKind, text: string): ParseResult {
   }
 }
 
-/** 配列に要素を1つ足したときの既定値。種類ごとに空の値を入れる */
-export function emptyElement(kind: ConfigKind): number | string {
-  return elementKind(kind) === "STRING" ? "" : 0;
+/** 配列を入力欄の文字列から読んだ結果 */
+export type ArrayParseResult =
+  | { ok: true; value: Array<number | string> }
+  | { ok: false; message: string };
+
+/**
+ * 配列を、表示と同じ `0, 1, 2` の形の文字列から読む。
+ *
+ * <p><b>括弧は打たせない。</b> 表の表示が括弧なしのカンマ区切りなので、
+ * 編集もその文字をそのまま直す形にして、表示と編集で見た目を変えない。
+ * 要素を消すなら文字を消し、足すなら `, 11` と打つだけで済む。
+ *
+ * <p>空の要素は捨てる。末尾のカンマ（`0, 1,`）や連続したカンマで弾かれると、
+ * 1つ消しただけで確定できなくなる。
+ *
+ * <p>⚠️ 文字列の配列で、要素そのものにカンマを含むものは表せない。
+ * 現在の config にそういう値は無い（replayVisible などは単語だけ）。
+ */
+export function parseArray(kind: ConfigKind, text: string): ArrayParseResult {
+  if (!isArrayKind(kind)) {
+    return { ok: false, message: `${kind} は配列ではありません` };
+  }
+  const itemKind = elementKind(kind);
+  const tokens = text
+    .split(",")
+    .map((token) => token.trim())
+    .filter((token) => token.length > 0);
+  const values: Array<number | string> = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const parsed = parseValue(itemKind, tokens[i] ?? "");
+    if (!parsed.ok) {
+      return { ok: false, message: `${i + 1} 番目の要素: ${parsed.message}` };
+    }
+    values.push(parsed.value);
+  }
+  return { ok: true, value: values };
 }
 
 /** 数値の種類か。表示を右寄せにするかの判定に使う */

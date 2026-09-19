@@ -14,7 +14,6 @@ import {
   allGroupPaths,
   buildTree,
   countLeaves,
-  defaultExpanded,
   displayValue,
   elementKind,
   filterTree,
@@ -22,6 +21,7 @@ import {
   isNumericKind,
   lastSegment,
   normalizeLayout,
+  parseArray,
   parseValue,
   toArray,
   toKind,
@@ -126,9 +126,6 @@ eq("枝のパスを全部集める", allGroupPaths(tree), [
   "visibility",
 ]);
 
-// --- 既定の折りたたみ ---
-eq("既定ではどこも開かない", defaultExpanded(tree), []);
-
 // --- 絞り込み ---
 eq("空の絞り込みは素通し", countLeaves(filterTree(tree, "  ")), nodes.length);
 eq("部分一致で葉を残す", countLeaves(filterTree(tree, "port")), 1);
@@ -171,6 +168,29 @@ eq("空の配列は空文字", displayValue("STRING_ARRAY", []), "");
 eq("配列でない値が来ても落ちない", displayValue("INT_ARRAY", 5), "");
 eq("スカラーはそのまま", displayValue("DOUBLE", 0.5), "0.5");
 eq("値が無ければ空文字", displayValue("STRING", undefined), "");
+
+// --- 配列の編集（表示と同じ文字をその場で直す） ---
+eq("カンマ区切りを読む", parseArray("INT_ARRAY", "0, 1, 2"), { ok: true, value: [0, 1, 2] });
+eq("表示した文字がそのまま読める", parseArray("INT_ARRAY", displayValue("INT_ARRAY", [3, 5])), {
+  ok: true,
+  value: [3, 5],
+});
+eq("空白は無くてもよい", parseArray("INT_ARRAY", "1,2"), { ok: true, value: [1, 2] });
+eq("末尾のカンマは無視", parseArray("INT_ARRAY", "0, 1,"), { ok: true, value: [0, 1] });
+eq("連続したカンマも無視", parseArray("INT_ARRAY", "0,, 1"), { ok: true, value: [0, 1] });
+eq("空なら空配列", parseArray("INT_ARRAY", "  "), { ok: true, value: [] });
+eq("整数の配列に小数は入れない", parseArray("INT_ARRAY", "0, 1.5").ok, false);
+eq(
+  "何番目が悪いかを言う",
+  parseArray("INT_ARRAY", "0, x"),
+  { ok: false, message: "2 番目の要素: 整数で入力してください" },
+);
+eq("小数の配列", parseArray("DOUBLE_ARRAY", "0.5, 2"), { ok: true, value: [0.5, 2] });
+eq("文字列の配列は前後の空白を落とす", parseArray("STRING_ARRAY", " robot , path "), {
+  ok: true,
+  value: ["robot", "path"],
+});
+eq("配列でない種類は弾く", parseArray("INT", "1").ok, false);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);
