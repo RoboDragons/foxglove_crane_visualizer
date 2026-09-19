@@ -15,9 +15,11 @@ import {
   buildTree,
   countLeaves,
   defaultExpanded,
+  displayValue,
   elementKind,
   filterTree,
   isArrayKind,
+  isNumericKind,
   lastSegment,
   normalizeLayout,
   parseValue,
@@ -161,6 +163,14 @@ eq("小数に整数も入る", parseValue("DOUBLE", "2"), { ok: true, value: 2 }
 eq("空は数値にしない", parseValue("DOUBLE", "  ").ok, false);
 eq("文字列は前後の空白を保つ", parseValue("STRING", " a "), { ok: true, value: " a " });
 eq("配列そのものは入力欄で扱わない", parseValue("INT_ARRAY", "[]").ok, false);
+
+// --- 表示 ---
+eq("数値の種類", [isNumericKind("INT"), isNumericKind("DOUBLE"), isNumericKind("STRING")], [true, true, false]);
+eq("配列は括弧なしで区切る", displayValue("INT_ARRAY", [0, 1, 2]), "0, 1, 2");
+eq("空の配列は空文字", displayValue("STRING_ARRAY", []), "");
+eq("配列でない値が来ても落ちない", displayValue("INT_ARRAY", 5), "");
+eq("スカラーはそのまま", displayValue("DOUBLE", 0.5), "0.5");
+eq("値が無ければ空文字", displayValue("STRING", undefined), "");
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

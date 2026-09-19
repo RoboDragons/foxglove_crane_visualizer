@@ -337,3 +337,21 @@ export function parseValue(kind: ConfigKind, text: string): ParseResult {
 export function emptyElement(kind: ConfigKind): number | string {
   return elementKind(kind) === "STRING" ? "" : 0;
 }
+
+/** 数値の種類か。表示を右寄せにするかの判定に使う */
+export function isNumericKind(kind: ConfigKind): boolean {
+  return kind === "INT" || kind === "DOUBLE";
+}
+
+/**
+ * 値を表の中で見せる文字列にする。
+ *
+ * <p>Swing の設定ツリーと同じく、<b>表示は文字、編集はクリックしてから</b>にする。
+ * 配列は括弧を付けずに `, ` で区切る。括弧は情報を足さず、幅だけ取る。
+ */
+export function displayValue(kind: ConfigKind, value: unknown): string {
+  if (isArrayKind(kind)) {
+    return toArray(value).map(formatValue).join(", ");
+  }
+  return formatValue(value);
+}
