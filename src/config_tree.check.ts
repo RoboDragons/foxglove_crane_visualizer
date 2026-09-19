@@ -22,6 +22,7 @@ import {
   normalizeLayout,
   parseValue,
   toArray,
+  toKind,
 } from "./config_tree";
 
 let pass = 0;
@@ -74,6 +75,20 @@ eq(
   normalizeLayout({ nodes: [{ path: "a", kind: "WAT" }] })?.[0]?.kind,
   "KIND_UNSPECIFIED",
 );
+
+// --- kind の正規化（Studio は proto の enum を数値で渡してくる） ---
+eq("数値の 1 は BOOL", toKind(1), "BOOL");
+eq("数値の 6 は INT_ARRAY", toKind(6), "INT_ARRAY");
+eq("数値の 0 は未設定", toKind(0), "KIND_UNSPECIFIED");
+eq("範囲外の数値は未設定", toKind(99), "KIND_UNSPECIFIED");
+eq("定数名でも受ける", toKind("ENUM"), "ENUM");
+eq("知らない文字列は未設定", toKind("WAT"), "KIND_UNSPECIFIED");
+eq("欠けていれば未設定", toKind(undefined), "KIND_UNSPECIFIED");
+eq(
+  "数値で届いた kind をメッセージから読める",
+  normalizeLayout({ nodes: [{ path: "a", kind: 1 }] })?.[0]?.kind,
+  "BOOL",
+);
 eq(
   "スネークケースの needs_reboot も読む",
   normalizeLayout({ nodes: [{ path: "a", needs_reboot: true }] })?.[0]?.needsReboot,
@@ -110,7 +125,7 @@ eq("枝のパスを全部集める", allGroupPaths(tree), [
 ]);
 
 // --- 既定の折りたたみ ---
-eq("1段目だけ開く", defaultExpanded(tree), ["networks", "visibility"]);
+eq("既定ではどこも開かない", defaultExpanded(tree), []);
 
 // --- 絞り込み ---
 eq("空の絞り込みは素通し", countLeaves(filterTree(tree, "  ")), nodes.length);

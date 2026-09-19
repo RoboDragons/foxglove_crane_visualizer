@@ -417,22 +417,10 @@ const LeafRow: React.FC<{
   return (
     <div className="rdccfg-row" style={rowStyle}>
       <div style={{ minWidth: 0 }}>
-        <div style={{ alignItems: "center", display: "flex", flexWrap: "wrap", gap: 4 }}>
-          <span>{node.label}</span>
-          {node.needsReboot && (
-            <span style={badgeStyle} title="起動時にしか読まれない。変更は再起動で効く">
-              再起動
-            </span>
-          )}
-          {node.risky && (
-            <span
-              style={{ ...badgeStyle, borderColor: colors.danger, color: colors.danger }}
-              title="組で意味を持つ値。走行中に変えると読み手が中途半端な状態を見る"
-            >
-              走行中注意
-            </span>
-          )}
-        </div>
+        {/* needsReboot / risky は受け取っているが行には出さない。
+            約 200 行すべてに小さな札が散ると、名前を読む妨げになるほうが大きい。
+            必要になったらツールチップか絞り込み条件として戻す */}
+        <span>{node.label}</span>
         {showPath && (
           <div style={{ fontSize: 10, opacity: 0.6, wordBreak: "break-all" }}>{node.path}</div>
         )}

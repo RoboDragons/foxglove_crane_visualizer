@@ -57,7 +57,16 @@ export type TreeItem = TreeLeaf | TreeGroup;
 // 正規化
 // ---------------------------------------------------------------------------
 
-const KINDS: ReadonlySet<string> = new Set([
+/**
+ * proto の {@code ConfigNode.Kind} の並び。添字が proto の番号に一致する。
+ *
+ * <p>🔴 <b>Studio は proto の enum を「数値」で渡してくる。</b>
+ * 定数名で届くと思って文字列だけを受けると、すべての葉が KIND_UNSPECIFIED に落ち、
+ * 真偽値がチェックボックスにならず配列も1行のテキストになる。
+ * しかも書き込み時に「扱えません」で弾かれるので、編集が一切できなくなる。
+ * 実機で踏んだ。念のため文字列でも受けられるようにしてある。
+ */
+const KIND_BY_NUMBER: readonly ConfigKind[] = [
   "KIND_UNSPECIFIED",
   "BOOL",
   "INT",
@@ -67,7 +76,20 @@ const KINDS: ReadonlySet<string> = new Set([
   "INT_ARRAY",
   "DOUBLE_ARRAY",
   "STRING_ARRAY",
-]);
+];
+
+const KINDS: ReadonlySet<string> = new Set(KIND_BY_NUMBER);
+
+/** 受け取った kind を正規化する。数値でも定数名でも受ける */
+export function toKind(value: unknown): ConfigKind {
+  if (typeof value === "number") {
+    return KIND_BY_NUMBER[value] ?? "KIND_UNSPECIFIED";
+  }
+  if (typeof value === "string" && KINDS.has(value)) {
+    return value as ConfigKind;
+  }
+  return "KIND_UNSPECIFIED";
+}
 
 /**
  * 受信したメッセージを `ConfigNode[]` に正規化する。
@@ -96,11 +118,7 @@ export function normalizeLayout(message: unknown): ConfigNode[] | undefined {
     if (path.length === 0) {
       continue;
     }
-    const kindValue = record["kind"];
-    const kind =
-      typeof kindValue === "string" && KINDS.has(kindValue)
-        ? (kindValue as ConfigKind)
-        : "KIND_UNSPECIFIED";
+    const kind = toKind(record["kind"]);
     const label = typeof record["label"] === "string" ? record["label"] : lastSegment(path);
     const choices = Array.isArray(record["choices"])
       ? record["choices"].filter((c): c is string => typeof c === "string")
@@ -197,11 +215,12 @@ export function filterTree(items: readonly TreeItem[], query: string): TreeItem[
 /**
  * 既定で開いておく枝のパス。
  *
- * <p><b>1段目だけ開く。</b> 全部畳むと何があるか分からず、
- * 全部開くと約 200 行が一度に出て読めない。
+ * <p><b>どこも開かない。</b> 1段目を開くと、枝とその配下の葉が入り混じって
+ * 縦に伸び、ルートに何があるかが読み取れなくなる。
+ * 畳んでおけば最初の画面が「章立て」になる。
  */
-export function defaultExpanded(items: readonly TreeItem[]): string[] {
-  return items.filter((item): item is TreeGroup => item.type === "group").map((g) => g.path);
+export function defaultExpanded(_items: readonly TreeItem[]): string[] {
+  return [];
 }
 
 /** 木に含まれる枝のパスをすべて集める。「すべて開く」に使う */
