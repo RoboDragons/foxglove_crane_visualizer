@@ -19,7 +19,6 @@ import {
   ConfigKind,
   ConfigNode,
   TreeItem,
-  countLeaves,
   displayValue,
   formatValue,
   isArrayKind,
@@ -388,15 +387,14 @@ const LeafRow: React.FC<{
 ));
 LeafRow.displayName = "LeafRow";
 
-/** 枝の行。値の列には配下の件数を薄く出す */
+/** 枝の行。値の列は空ける（Swing と同じ） */
 const GroupRow: React.FC<{
   label: string;
   depth: number;
   open: boolean;
-  count: number;
   nameWidth: number;
   onToggle: () => void;
-}> = ({ label, depth, open, count, nameWidth, onToggle }) => (
+}> = ({ label, depth, open, nameWidth, onToggle }) => (
   <div
     className="rdccfg-row"
     style={{ ...rowStyle(nameWidth), cursor: "pointer" }}
@@ -411,7 +409,7 @@ const GroupRow: React.FC<{
         {label}
       </span>
     </div>
-    <div style={{ ...valueCellStyle("STRING"), opacity: 0.5 }}>{count}</div>
+    <div />
   </div>
 );
 
@@ -458,7 +456,6 @@ const TreeRows: React.FC<TreeRowsProps> = (props) => (
             label={item.label}
             depth={props.depth}
             open={props.expanded[item.path] === true}
-            count={countLeaves(item.children)}
             nameWidth={props.nameWidth}
             onToggle={() => {
               props.onToggle(item.path);
